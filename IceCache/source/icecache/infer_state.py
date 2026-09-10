@@ -202,9 +202,50 @@ class InferState:
         self.profile_dci_calls = 0
         self.profile_dci_seconds = 0.0
         self.profile_decode_seconds = 0.0
+        self.profile_cross_token_reuses = 0
+        self.profile_cross_token_reuse_calls = 0
+        self.profile_cross_token_boundary_refreshes = 0
         self._profile_decode_start = None
         self.nn_idx_all = None
         self.attn_layers = [None] * n_layers
+
+        # Optional, read-only DCI selection diagnostic.  It never changes the
+        # selected pages; it only compares consecutive decode selections from
+        # the same anchor layer and KV head.
+        self.trace_dci_churn = bool(int(
+            os.environ.get("ICECACHE_TRACE_DCI_CHURN", "0")))
+        self._trace_prev_selection = [None] * n_layers
+        self._trace_overlap = []
+        self._trace_top25_overlap = []
+        self._trace_top50_overlap = []
+        self._trace_exact = []
+        self._trace_by_layer = defaultdict(list)
+        self._trace_by_head = defaultdict(list)
+
+        # Cross-token event-driven DCI gate.  When the layer's query vector
+        # hasn't moved much since the last DCI call, we skip the search and
+        # reuse the previously-selected page set.  Four safety valves keep
+        # this safe: max-consecutive-reuse, force-refresh cadence, cosine
+        # threshold, and a structural-boundary override.  This remains an
+        # experimental, opt-in path because it regresses long-form QA.
+        self.enable_cross_token_dci = bool(int(
+            os.environ.get("ICECACHE_CROSS_TOKEN_DCI", "0")))
+        # 1 - cos(q_t, q_{t-1}) below this triggers a reuse.
+        self.cosine_reuse_threshold = float(
+            os.environ.get("ICECACHE_CROSS_TOKEN_COS", "0.05"))
+        # Stop reusing after this many consecutive same-layer skips.
+        self.max_consec_reuse = int(
+            os.environ.get("ICECACHE_CROSS_TOKEN_MAX", "8"))
+        # Always refresh after this many layers since the last DCI call.
+        self.force_refresh_every = int(
+            os.environ.get("ICECACHE_CROSS_TOKEN_REFRESH", "16"))
+        # Per-layer tracking of the query signature that drove the last DCI
+        # call.  Stored as a normalized head-dim vector on CPU.
+        self.prev_query_sig = [None] * n_layers
+        self.layer_reuse_count = [0] * n_layers
+        self.layers_since_refresh = [0] * n_layers
+        # Per-token boundary flag, set in _prepare_decode.
+        self._token_is_boundary = False
 
         self.default_stream = torch.cuda.default_stream(self.device)
         self.prefill_backup_stream = torch.cuda.Stream(self.device)
@@ -290,10 +331,63 @@ class InferState:
         else:
             return cur_id-position_in_cycle
 
+    def _query_signature(self, query_states):
+        """Cheap, head-mean, normalized signature for cosine-based gating.
+
+        query_states has shape [bsz, 1, n_qo_heads, head_dim].  We average
+        across heads to produce a single head_dim-vector, then L2-normalize
+        so a dot-product becomes cosine similarity.  Stays on CPU to keep
+        the gate off the GPU critical path.
+        """
+        sig = query_states.reshape(-1, self.head_dim).mean(dim=0)
+        sig = sig.float().detach().cpu()
+        norm = torch.linalg.vector_norm(sig)
+        if norm.item() == 0.0:
+            return sig
+        return sig / norm
+
+    def _can_reuse_cross_token(self, layer_idx, query_states):
+        """Return True if we should reuse the previous DCI result for this
+        layer instead of running a fresh search."""
+        if not self.enable_cross_token_dci:
+            return False
+        if self.prev_query_sig[layer_idx] is None:
+            return False
+        if self._token_is_boundary:
+            # A page boundary reshuffled the cache; refresh once.
+            self.profile_cross_token_boundary_refreshes += 1
+            return False
+        if self.layers_since_refresh[layer_idx] >= self.force_refresh_every:
+            return False
+        if self.layer_reuse_count[layer_idx] >= self.max_consec_reuse:
+            return False
+        self.profile_cross_token_reuse_calls += 1
+        cur_sig = self._query_signature(query_states)
+        cos_sim = torch.dot(self.prev_query_sig[layer_idx], cur_sig).item()
+        # Reuse when the query hasn't moved much (1 - cos is small).
+        return (1.0 - cos_sim) < self.cosine_reuse_threshold
+
+    def _update_query_signature(self, layer_idx, query_states):
+        self.prev_query_sig[layer_idx] = self._query_signature(query_states)
+        self.layer_reuse_count[layer_idx] = 0
+        self.layers_since_refresh[layer_idx] = 0
+
     def _prepare_prefill(self, bsz, q_len):
         # Each prompt has its own cache fill and initial recalls, so warm-up
         # must restart per sequence while aggregate counters remain intact.
         self.profile_sequence_decode_steps = 0
+        # Cross-token gate state is per-sequence; reset on each new prompt.
+        for i in range(self.n_layers):
+            self.prev_query_sig[i] = None
+            self.layer_reuse_count[i] = 0
+            self.layers_since_refresh[i] = 0
+        self._token_is_boundary = False
+        # Do not compare the last decode selection of one sample with the
+        # first selection of the next sample.
+        self._trace_prev_selection = [None] * self.n_layers
+        self.profile_cross_token_reuses = 0
+        self.profile_cross_token_reuse_calls = 0
+        self.profile_cross_token_boundary_refreshes = 0
         self.num_offload_pages = None
         self.n_dci_pages = None
         self.offload_win_flag = [False] * self.n_layers
@@ -493,6 +587,13 @@ class InferState:
             torch.cuda.synchronize(self.device)
             self._profile_decode_start = perf_counter()
 
+        # A new page boundary lands on the token that fills a page slot.
+        # Force-refresh the cross-token gate state so the just-bumped cache
+        # layout is observed by DCI on the next call.
+        self._token_is_boundary = (
+            self.kv_last_page_len + 1 >= self.page_size
+        )
+
         if self.kv_last_page_len + 1 >= self.page_size:  # n_win_pages >= 2
             self.default_stream.wait_stream(self.decode_backup_stream)
             if self.offload_win_flag[-1]:
@@ -561,6 +662,7 @@ class InferState:
     def get_profile_stats(self):
         """Return aggregate steady-state decode timing statistics in seconds."""
         measured = self.profile_measured_steps
+        total_steps = max(self.profile_decode_steps, 1)
         return {
             "warmup_tokens": self.profile_warmup_tokens,
             "decode_steps_total": self.profile_decode_steps,
@@ -572,6 +674,98 @@ class InferState:
             "dci_select_ms_per_token": 1000 * self.profile_dci_seconds / measured if measured else None,
             "dci_share": self.profile_dci_seconds / self.profile_decode_seconds if self.profile_decode_seconds else None,
             "dci_calls_per_token": self.profile_dci_calls / measured if measured else None,
+            "cross_token_reuses": self.profile_cross_token_reuses,
+            "cross_token_reuse_calls": self.profile_cross_token_reuse_calls,
+            "cross_token_reuse_share": (
+                self.profile_cross_token_reuses
+                / self.profile_cross_token_reuse_calls
+                if self.profile_cross_token_reuse_calls else None
+            ),
+            "cross_token_boundary_refreshes": self.profile_cross_token_boundary_refreshes,
+            "cross_token_skip_rate": (
+                self.profile_cross_token_reuses / total_steps / self.n_layers
+                if total_steps else None
+            ),
+        }
+
+    @staticmethod
+    def _selection_overlap(current, previous, prefix=None):
+        """Set overlap normalized by the current selection width."""
+        if prefix is not None:
+            current = current[:prefix]
+            previous = previous[:prefix]
+        current_set = set(int(x) for x in current if x >= 0)
+        previous_set = set(int(x) for x in previous if x >= 0)
+        if not current_set:
+            return 1.0
+        return len(current_set & previous_set) / len(current_set)
+
+    def _trace_dci_selection(self, layer_idx, selection):
+        if not self.trace_dci_churn:
+            return
+        current = np.asarray(selection, dtype=np.int32).copy()
+        previous = self._trace_prev_selection[layer_idx]
+        self._trace_prev_selection[layer_idx] = current
+        if previous is None or previous.shape != current.shape:
+            return
+
+        width = current.shape[1]
+        top25 = max(1, width // 4)
+        top50 = max(1, width // 2)
+        for head_idx in range(current.shape[0]):
+            overlap = self._selection_overlap(
+                current[head_idx], previous[head_idx])
+            overlap25 = self._selection_overlap(
+                current[head_idx], previous[head_idx], top25)
+            overlap50 = self._selection_overlap(
+                current[head_idx], previous[head_idx], top50)
+            exact = float(np.array_equal(
+                current[head_idx], previous[head_idx]))
+            self._trace_overlap.append(overlap)
+            self._trace_top25_overlap.append(overlap25)
+            self._trace_top50_overlap.append(overlap50)
+            self._trace_exact.append(exact)
+            self._trace_by_layer[layer_idx].append(overlap)
+            self._trace_by_head[head_idx].append(overlap)
+
+    def get_dci_churn_stats(self):
+        """Return aggregate consecutive-token page-selection stability."""
+        def summarize(values):
+            if not values:
+                return None
+            values = np.asarray(values, dtype=np.float64)
+            return {
+                "count": int(values.size),
+                "mean": float(values.mean()),
+                "p10": float(np.percentile(values, 10)),
+                "p50": float(np.percentile(values, 50)),
+                "p90": float(np.percentile(values, 90)),
+            }
+
+        return {
+            "all_topk_overlap": summarize(self._trace_overlap),
+            "top25_overlap": summarize(self._trace_top25_overlap),
+            "top50_overlap": summarize(self._trace_top50_overlap),
+            "exact_same_share": (
+                float(np.mean(self._trace_exact))
+                if self._trace_exact else None
+            ),
+            "share_overlap_ge_90pct": (
+                float(np.mean(np.asarray(self._trace_overlap) >= 0.9))
+                if self._trace_overlap else None
+            ),
+            "share_overlap_ge_75pct": (
+                float(np.mean(np.asarray(self._trace_overlap) >= 0.75))
+                if self._trace_overlap else None
+            ),
+            "by_layer_mean": {
+                str(k): float(np.mean(v))
+                for k, v in sorted(self._trace_by_layer.items())
+            },
+            "by_kv_head_mean": {
+                str(k): float(np.mean(v))
+                for k, v in sorted(self._trace_by_head.items())
+            },
         }
 
     def begin_forward(self, bsz, q_len):
@@ -901,6 +1095,8 @@ class InferState:
             nn_idx_0 = np.ascontiguousarray(nn_idx_0)
             nn_idx_1 = np.ascontiguousarray(nn_idx_1)
 
+            self._trace_dci_selection(cur_id, nn_idx_0)
+
             padded_arrays = torch.tensor(nn_idx_0, **self._ci32)
             head_ids = torch.arange(
                 self.n_kv_heads, device=padded_arrays.device).unsqueeze(1)
@@ -1000,16 +1196,34 @@ class InferState:
 
         if kvc.n_real_pages == kvc.budget and self.use_dci:
             ns = kvc.n_sink_pages
+            cross_token_reused = False
             for i in range(kvc.batch_size):
 
                 if self.check_reuse(layer_idx) == 0:
-                    dci_start = perf_counter() if self._profile_is_measured_step() else None
-                    eids, rids, nr = self._DCI_query(
-                        i, layer_idx, query_states[i].cpu().detach().transpose(0, 1))
-                    if dci_start is not None:
-                        self.profile_dci_seconds += perf_counter() - dci_start
-                        self.profile_dci_calls += 1
-                
+                    if self._can_reuse_cross_token(layer_idx, query_states[i]):
+                        # Same layer, query hasn't moved → reuse the prior
+                        # selection.  Between two non-boundary decode tokens
+                        # the GPU paged cache and DCI index haven't moved,
+                        # so the previously-selected pages are still
+                        # resident and no CPU→GPU recall is needed.  We
+                        # also skip the diff_pages_by_head bookkeeping since
+                        # the resident set is identical to last token's.
+                        eids = self.prev_eids.clone()
+                        nr = torch.zeros_like(self.prev_nr)
+                        rids = self.prev_rids.clone()
+                        cross_token_reused = True
+                        self.profile_cross_token_reuses += 1
+                        self.layer_reuse_count[layer_idx] += 1
+                        self.layers_since_refresh[layer_idx] += 1
+                    else:
+                        dci_start = perf_counter() if self._profile_is_measured_step() else None
+                        eids, rids, nr = self._DCI_query(
+                            i, layer_idx, query_states[i].cpu().detach().transpose(0, 1))
+                        if dci_start is not None:
+                            self.profile_dci_seconds += perf_counter() - dci_start
+                            self.profile_dci_calls += 1
+                        self._update_query_signature(layer_idx, query_states[i])
+
                     self.prev_nr = nr
                     self.prev_eids = eids
                     self.prev_rids = rids
@@ -1024,7 +1238,7 @@ class InferState:
                     rids = self.prev_rids.clone()
                     assert eids is not None and nr is not None and rids is not None
 
-                if eids is not None:
+                if eids is not None and not cross_token_reused:
 
                     self.recall(layer_idx, i, rids, nr)
 

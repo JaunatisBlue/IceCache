@@ -1,3 +1,7 @@
 IceCache/source/icecache_cpp.*
 experiment/
 __pycache__
+IceCache/benchmark/passkey.jsonl
+IceCache/benchmark/pred/**/baseline_*/
+IceCache/benchmark/pred/**/dci_churn_*/
+IceCache/benchmark/pred/**/xtok_*/

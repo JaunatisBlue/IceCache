@@ -54,6 +54,10 @@ def parse_args(cmd_args=None):
     ap.add_argument("--n_prefetch_layers", type=int, default=0)
     ap.add_argument("--n_reuse_layers", type=int, default=0)
     ap.add_argument(
+        "--max-samples", type=int, default=None,
+        help="Run a deterministic length-stratified subset of each dataset.",
+    )
+    ap.add_argument(
         "--datasets",
         nargs="+",
         default=[
@@ -85,6 +89,19 @@ def parse_args(cmd_args=None):
     if args.page_budgets < 0:
         args.page_budgets = None
     return args
+
+
+def length_stratified_subset(data, max_samples):
+    """Choose deterministic, approximately even length quantiles."""
+    data = list(data)
+    if max_samples is None or max_samples >= len(data):
+        return data
+    ordered = sorted(enumerate(data), key=lambda item: item[1]["length"])
+    positions = np.linspace(0, len(ordered) - 1, max_samples, dtype=int)
+    # Restore dataset order so result files remain easy to compare.
+    selected = sorted((ordered[pos] for pos in positions), key=lambda item: item[0])
+    print("SUBSET_INDICES " + json.dumps([idx for idx, _ in selected]))
+    return [row for _, row in selected]
 
 
 # This is the customized building prompt for chat models
@@ -283,6 +300,21 @@ def get_pred(
             )
             f.write("\n")
 
+        # Persist the cumulative diagnostic after every sample so a native
+        # DCI/CUDA failure cannot discard a long in-memory trace.
+        trace_path = os.environ.get("ICECACHE_TRACE_DCI_CHURN_PATH")
+        if trace_path and hasattr(model, "_icecache_infer_state"):
+            trace_tmp_path = trace_path + ".tmp"
+            with open(trace_tmp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    model._icecache_infer_state.get_dci_churn_stats(),
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            os.replace(trace_tmp_path, trace_path)
+
         if use_3_stages_gen:
             generate.reset_q_input_ids()
 
@@ -355,6 +387,7 @@ if __name__ == "__main__":
         prompt_format = dataset2prompt[dataset]
         max_gen = dataset2maxlen[dataset]
 
+        data = length_stratified_subset(data, args.max_samples)
         get_pred(
             model,
             tokenizer,
@@ -368,3 +401,8 @@ if __name__ == "__main__":
             out_path,
             use_3_stages_gen=args.use_3_stages_gen,
         )
+
+    if args.icecache and bool(int(os.environ.get("ICECACHE_TRACE_DCI_CHURN", "0"))):
+        state = model._icecache_infer_state
+        print("DCI_CHURN " + json.dumps(
+            state.get_dci_churn_stats(), sort_keys=True))
