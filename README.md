@@ -113,6 +113,9 @@ Enable it with `ICECACHE_FP16_RECALL=1`. IceCache validates the native
 extension at startup and fails with a clear error if the required conversion
 path is missing. This keeps the CPU DCI index in FP32, converts selected pages
 to FP16 in pinned host memory, and halves their CPU-to-GPU transfer volume.
+The same patch also fuses ordered GQA candidate merging into the native
+extension; IceCache detects that symbol automatically and otherwise falls
+back to the portable NumPy/Python path.
 
 On a single long-running request, match OpenMP workers to physical CPU cores
 to avoid SMT oversubscription. For a 32-core/64-thread dual-socket host:

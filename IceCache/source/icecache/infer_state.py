@@ -18,6 +18,10 @@ import icecache_cpp as _cpp
 import numpy as np
 from time import time, perf_counter
 from dciknn import DCI
+try:
+    from dciknn._dci import _dci_first_k_unique_by_head
+except ImportError:
+    _dci_first_k_unique_by_head = None
 from tqdm import tqdm
 import copy
 from ctypes import c_float, POINTER, cast, c_void_p
@@ -222,6 +226,9 @@ class InferState:
         self.profile_query_d2h_seconds = 0.0
         self.profile_native_query_seconds = 0.0
         self.profile_query_postprocess_seconds = 0.0
+        self.profile_query_dedup_seconds = 0.0
+        self.profile_query_mapping_seconds = 0.0
+        self.profile_query_diff_seconds = 0.0
         self.profile_recall_gather_seconds = 0.0
         self.profile_recall_wait_seconds = 0.0
         self.profile_page_metadata_seconds = 0.0
@@ -729,6 +736,9 @@ class InferState:
             "query_d2h_ms_per_token": 1000 * self.profile_query_d2h_seconds / measured if measured else None,
             "native_query_ms_per_token": 1000 * self.profile_native_query_seconds / measured if measured else None,
             "query_postprocess_ms_per_token": 1000 * self.profile_query_postprocess_seconds / measured if measured else None,
+            "query_dedup_ms_per_token": 1000 * self.profile_query_dedup_seconds / measured if measured else None,
+            "query_mapping_ms_per_token": 1000 * self.profile_query_mapping_seconds / measured if measured else None,
+            "query_diff_ms_per_token": 1000 * self.profile_query_diff_seconds / measured if measured else None,
             "recall_gather_ms_per_token": 1000 * self.profile_recall_gather_seconds / measured if measured else None,
             "recall_wait_ms_per_token": 1000 * self.profile_recall_wait_seconds / measured if measured else None,
             "page_metadata_ms_per_token": 1000 * self.profile_page_metadata_seconds / measured if measured else None,
@@ -1149,33 +1159,52 @@ class InferState:
             postprocess_start = perf_counter() if profile_stage else None
 
             nn_idx = nn_idx.reshape(self.n_qo_heads, 2, -1)
-            nn_idx_0 = nn_idx[:, 0, :].reshape(self.n_kv_heads, self.ratio, -1)
             nn_idx_1 = nn_idx[:, 1, :].reshape(self.n_kv_heads, self.ratio, -1)
             if self.n_prefetch_layers > 1:
                 self.nn_idx_all[b, cur_id] = nn_idx_1
 
             # Handle the case where there are duplicated integers in the same row of nn_idx_0
+            dedup_start = perf_counter() if profile_stage else None
             if self.ratio > 1:
-                nn_idx_0_interleaved = nn_idx_0.transpose(
-                    0, 2, 1).reshape(self.n_kv_heads, -1)
-                nn_idx_0 = np.vstack([utils.first_k_unique(
-                    row, num_neighbours) for row in nn_idx_0_interleaved])
+                if _dci_first_k_unique_by_head is not None:
+                    nn_idx_0 = _dci_first_k_unique_by_head(
+                        nn_idx,
+                        self.n_kv_heads,
+                        self.ratio,
+                        num_neighbours,
+                    )
+                else:
+                    nn_idx_0 = nn_idx[:, 0, :].reshape(
+                        self.n_kv_heads, self.ratio, -1)
+                    nn_idx_0_interleaved = nn_idx_0.transpose(
+                        0, 2, 1).reshape(self.n_kv_heads, -1)
+                    nn_idx_0 = np.vstack([utils.first_k_unique(
+                        row, num_neighbours)
+                        for row in nn_idx_0_interleaved])
             else:
-                nn_idx_0 = nn_idx_0.reshape(self.n_kv_heads, -1)
+                nn_idx_0 = nn_idx[:, 0, :].reshape(self.n_kv_heads, -1)
 
             nn_idx_0 = np.ascontiguousarray(nn_idx_0)
             nn_idx_1 = np.ascontiguousarray(nn_idx_1)
+            if dedup_start is not None:
+                self.profile_query_dedup_seconds += (
+                    perf_counter() - dedup_start)
 
             self._trace_dci_selection(cur_id, nn_idx_0)
 
+            mapping_start = perf_counter() if profile_stage else None
             padded_arrays = torch.tensor(nn_idx_0, **self._ci32)
             head_ids = torch.arange(
                 self.n_kv_heads, device=padded_arrays.device).unsqueeze(1)
+            if mapping_start is not None:
+                self.profile_query_mapping_seconds += (
+                    perf_counter() - mapping_start)
 
             # The number of recall slots can change while the cache transitions
             # from prefill to steady-state decoding.  In that case an old page
             # set has a different width and cannot be diffed against the new
             # selection.  Treat it as a fresh resident-set initialization.
+            diff_start = perf_counter() if profile_stage else None
             if (
                 self.selected_page_idx[cur_id] is None
                 or self.selected_page_idx[cur_id].shape != nn_idx_0.shape
@@ -1191,6 +1220,9 @@ class InferState:
                 self.selected_page_idx[cur_id] = out_idx
                 recall_idx = torch.tensor(recall_idx, **self._i32)
                 evicted_idx = torch.tensor(evicted_idx, **self._i32)
+            if diff_start is not None:
+                self.profile_query_diff_seconds += (
+                    perf_counter() - diff_start)
             
             evict_num = (recall_idx >= 0).sum(1)
             kvc.ccc[b, head_ids, padded_arrays] = 0

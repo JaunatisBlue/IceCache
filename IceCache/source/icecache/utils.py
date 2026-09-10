@@ -56,6 +56,17 @@ def cat(*xs, dim=0, **kwargs):
 
 
 def first_k_unique(row, k):
-    _, idx = np.unique(row, return_index=True)
-    idx_sorted = np.sort(idx)[:k]
-    return row[idx_sorted]
+    # np.unique sorts the whole row before recovering first-occurrence
+    # indices. GQA only needs the first k page ids in encounter order, so stop
+    # as soon as the output budget is full.
+    values = []
+    seen = set()
+    for value in row:
+        item = int(value)
+        if item in seen:
+            continue
+        seen.add(item)
+        values.append(item)
+        if len(values) == k:
+            break
+    return np.asarray(values, dtype=row.dtype)

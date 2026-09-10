@@ -1,5 +1,5 @@
 diff --git a/src/py_dci.c b/src/py_dci.c
-index 59d0832..9b7a180 100644
+index 59d0832..8312e6b 100644
 --- a/src/py_dci.c
 +++ b/src/py_dci.c
 @@ -30,6 +30,20 @@
@@ -49,4 +49,76 @@ index 59d0832..9b7a180 100644
 +                         current_src_page + offset_s, copy_len);
          }
      }
+ 
+@@ -2732,8 +2757,62 @@ static PyObject *diff_pages_by_head(PyObject *self, PyObject *args) {
+     return Py_BuildValue("NNN", py_result_A, py_result_B, py_result_O);
+ }
+ 
++static PyObject *first_k_unique_by_head(PyObject *self, PyObject *args) {
++    PyArrayObject *py_candidates;
++    int num_kv_heads, ratio, output_size;
++
++    if (!PyArg_ParseTuple(args, "O!iii", &PyArray_Type, &py_candidates,
++                          &num_kv_heads, &ratio, &output_size))
++        return NULL;
++
++    if (PyArray_NDIM(py_candidates) != 3 ||
++        PyArray_TYPE(py_candidates) != NPY_INT32 ||
++        !PyArray_IS_C_CONTIGUOUS(py_candidates)) {
++        PyErr_SetString(PyExc_ValueError,
++                        "candidates must be a contiguous int32 [Q,2,N] array");
++        return NULL;
++    }
++
++    npy_intp *shape = PyArray_SHAPE(py_candidates);
++    if (shape[0] != num_kv_heads * ratio || shape[1] != 2) {
++        PyErr_SetString(PyExc_ValueError, "candidate shape does not match GQA");
++        return NULL;
++    }
++
++    int num_candidates = (int)shape[2];
++    int32_t *input = (int32_t *)PyArray_DATA(py_candidates);
++    npy_intp dims[2] = {num_kv_heads, output_size};
++    PyArrayObject *py_output =
++        (PyArrayObject *)PyArray_EMPTY(2, dims, NPY_INT32, 0);
++    int32_t *output = (int32_t *)PyArray_DATA(py_output);
++
++#pragma omp parallel for
++    for (int h = 0; h < num_kv_heads; ++h) {
++        int count = 0;
++        for (int c = 0; c < num_candidates && count < output_size; ++c) {
++            for (int r = 0; r < ratio && count < output_size; ++r) {
++                int qh = h * ratio + r;
++                int32_t value = input[(qh * 2) * num_candidates + c];
++                bool seen = false;
++                for (int j = 0; j < count; ++j) {
++                    if (output[h * output_size + j] == value) {
++                        seen = true;
++                        break;
++                    }
++                }
++                if (!seen)
++                    output[h * output_size + count++] = value;
++            }
++        }
++        for (; count < output_size; ++count)
++            output[h * output_size + count] = -1;
++    }
++
++    return (PyObject *)py_output;
++}
++
+ 
+-// Methods table - maps names in Python to C functions  
++// Methods table - maps names in Python to C functions
+ static PyMethodDef py_dci_module_methods[] = {
+     {"_dci_new", py_dci_new, METH_VARARGS, "Create new DCI instance."},
+     {"_dci_address_update", py_dci_address_update, METH_VARARGS, "Update the address of the points in DCI instance."},
+@@ -2763,6 +2842,7 @@ static PyMethodDef py_dci_module_methods[] = {
+     {"_dci_reuse_copy_node", reuse_copy_node, METH_VARARGS, "Reuse copy to buffer."},
+     {"_dci_reuse_update_node", reuse_update_node, METH_VARARGS, "Reuse update to buffer."},
+     {"_dci_diff_pages_by_head", diff_pages_by_head, METH_VARARGS, "Diff pages by head."},
++    {"_dci_first_k_unique_by_head", first_k_unique_by_head, METH_VARARGS, "Merge GQA candidates in encounter order."},
+     {NULL, NULL, 0, NULL}
+ };
  
