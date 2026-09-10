@@ -202,6 +202,19 @@ class InferState:
         self.profile_dci_calls = 0
         self.profile_dci_seconds = 0.0
         self.profile_decode_seconds = 0.0
+        # Coarse system-boundary timers.  These deliberately avoid timing
+        # individual M-DCI tree operations and instead expose where decode
+        # crosses between GPU, CPU search, page metadata, and KV transfer.
+        self.profile_query_d2h_seconds = 0.0
+        self.profile_native_query_seconds = 0.0
+        self.profile_query_postprocess_seconds = 0.0
+        self.profile_recall_gather_seconds = 0.0
+        self.profile_recall_wait_seconds = 0.0
+        self.profile_page_metadata_seconds = 0.0
+        self.profile_index_update_seconds = 0.0
+        self.profile_recall_calls = 0
+        self.profile_recall_pages = 0
+        self.profile_index_update_calls = 0
         self.profile_cross_token_reuses = 0
         self.profile_cross_token_reuse_calls = 0
         self.profile_cross_token_boundary_refreshes = 0
@@ -674,6 +687,16 @@ class InferState:
             "dci_select_ms_per_token": 1000 * self.profile_dci_seconds / measured if measured else None,
             "dci_share": self.profile_dci_seconds / self.profile_decode_seconds if self.profile_decode_seconds else None,
             "dci_calls_per_token": self.profile_dci_calls / measured if measured else None,
+            "query_d2h_ms_per_token": 1000 * self.profile_query_d2h_seconds / measured if measured else None,
+            "native_query_ms_per_token": 1000 * self.profile_native_query_seconds / measured if measured else None,
+            "query_postprocess_ms_per_token": 1000 * self.profile_query_postprocess_seconds / measured if measured else None,
+            "recall_gather_ms_per_token": 1000 * self.profile_recall_gather_seconds / measured if measured else None,
+            "recall_wait_ms_per_token": 1000 * self.profile_recall_wait_seconds / measured if measured else None,
+            "page_metadata_ms_per_token": 1000 * self.profile_page_metadata_seconds / measured if measured else None,
+            "index_update_ms_per_token": 1000 * self.profile_index_update_seconds / measured if measured else None,
+            "recall_calls_per_token": self.profile_recall_calls / measured if measured else None,
+            "recall_pages_per_token": self.profile_recall_pages / measured if measured else None,
+            "index_update_calls": self.profile_index_update_calls,
             "cross_token_reuses": self.profile_cross_token_reuses,
             "cross_token_reuse_calls": self.profile_cross_token_reuse_calls,
             "cross_token_reuse_share": (
@@ -1041,6 +1064,8 @@ class InferState:
     def _DCI_query(self, b, cur_id, query_states):
         if self.use_dci:
 
+            profile_stage = self._profile_is_measured_step()
+
             bsz = 1
 
             num_neighbours = self.n_dci_pages - self.layer2topk[cur_id]
@@ -1065,6 +1090,7 @@ class InferState:
 
             assert (_query.flags['C_CONTIGUOUS'])
 
+            native_query_start = perf_counter() if profile_stage else None
             nn_idx, _ = self.dci_db[cur_id].query(_query,
                                                 padding_mask,
                                                 num_neighbours=num_neighbours,
@@ -1076,6 +1102,11 @@ class InferState:
                                                 parallel_level=self.parallel_level,
                                                 ratio=self.ratio,
                                             )
+            if native_query_start is not None:
+                self.profile_native_query_seconds += (
+                    perf_counter() - native_query_start)
+
+            postprocess_start = perf_counter() if profile_stage else None
 
             nn_idx = nn_idx.reshape(self.n_qo_heads, 2, -1)
             nn_idx_0 = nn_idx[:, 0, :].reshape(self.n_kv_heads, self.ratio, -1)
@@ -1124,6 +1155,10 @@ class InferState:
             evict_num = (recall_idx >= 0).sum(1)
             kvc.ccc[b, head_ids, padded_arrays] = 0
 
+            if postprocess_start is not None:
+                self.profile_query_postprocess_seconds += (
+                    perf_counter() - postprocess_start)
+
             return evicted_idx.contiguous(), recall_idx.contiguous(), evict_num
 
     def append_paged_kv_cache(self, layer_idx: int, keys: Tensor, vals: Tensor):
@@ -1148,6 +1183,9 @@ class InferState:
             # Fallback to main thread CUDA objects
             c2g_stream = self.c2g_stream
 
+        profile_stage = self._profile_is_measured_step()
+        gather_start = perf_counter() if profile_stage else None
+
         n_transit_pages = torch.sum(nr).item()
 
         rids_cpu = rids.cpu()
@@ -1165,6 +1203,10 @@ class InferState:
                                offset_s=self.n_kv_heads*self.page_size*self.head_dim,
                                offset_t=n_transit_pages*self.page_size*self.head_dim,
                                dim=self.head_dim, page_size=self.page_size*self.head_dim, dtype=0)
+        if gather_start is not None:
+            self.profile_recall_gather_seconds += perf_counter() - gather_start
+            self.profile_recall_calls += 1
+            self.profile_recall_pages += n_transit_pages
         ############################################################
 
         with torch.cuda.stream(c2g_stream):
@@ -1217,8 +1259,13 @@ class InferState:
                         self.layers_since_refresh[layer_idx] += 1
                     else:
                         dci_start = perf_counter() if self._profile_is_measured_step() else None
+                        query_d2h_start = dci_start
+                        query_states_cpu = query_states[i].cpu().detach().transpose(0, 1)
+                        if query_d2h_start is not None:
+                            self.profile_query_d2h_seconds += (
+                                perf_counter() - query_d2h_start)
                         eids, rids, nr = self._DCI_query(
-                            i, layer_idx, query_states[i].cpu().detach().transpose(0, 1))
+                            i, layer_idx, query_states_cpu)
                         if dci_start is not None:
                             self.profile_dci_seconds += perf_counter() - dci_start
                             self.profile_dci_calls += 1
@@ -1242,14 +1289,28 @@ class InferState:
 
                     self.recall(layer_idx, i, rids, nr)
 
+                    metadata_start = (
+                        perf_counter() if self._profile_is_measured_step()
+                        else None
+                    )
                     if self.check_reuse(layer_idx) == 0:
                         self.page_valid_entries[layer_idx][ns: ns + self.n_dci_pages - self.layer2topk[layer_idx]] = torch.tensor(
                             self.dci_db[layer_idx].get_valid_entries(self.selected_page_idx[layer_idx]), **self._i32).T
                     else:
                         self.page_valid_entries[layer_idx][ns: ns + self.n_dci_pages - self.layer2topk[layer_idx]] = torch.tensor(
                             self.dci_db[reuse_id].get_valid_entries(self.selected_page_idx[reuse_id]), **self._i32).T
+                    if metadata_start is not None:
+                        self.profile_page_metadata_seconds += (
+                            perf_counter() - metadata_start)
 
+                recall_wait_start = (
+                    perf_counter() if self._profile_is_measured_step()
+                    else None
+                )
                 c2g_stream.synchronize()
+                if recall_wait_start is not None:
+                    self.profile_recall_wait_seconds += (
+                        perf_counter() - recall_wait_start)
 
         return eids, nr
 
@@ -1323,6 +1384,9 @@ class InferState:
                         kvc[i, kvc.next_evict_idx+ci], non_blocking=True)
 
     def offload_win_page_to_DCI(self, layer_idx: int):
+        update_start = (
+            perf_counter() if self._profile_is_measured_step() else None
+        )
         win_kvc = self.offload_win_caches[layer_idx]
         kvc = self.kv_caches[layer_idx]
         if kvc.budget is None:
@@ -1331,6 +1395,9 @@ class InferState:
             sub_kv_states = win_kvc[i, :self.num_evict_win].permute(1, 0, 2, 3, 4).permute(
                 0, 2, 1, 3, 4).reshape(2, self.n_kv_heads, -1, self.head_dim)
             self._DCI_add(i, layer_idx, sub_kv_states[0], sub_kv_states[1])
+        if update_start is not None:
+            self.profile_index_update_seconds += perf_counter() - update_start
+            self.profile_index_update_calls += 1
 
 
     async def prefill_evict_extra_pages_wrapper(self, layer_idx: int, query_states: Tensor, projected: Tensor):
