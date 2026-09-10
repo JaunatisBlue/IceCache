@@ -72,6 +72,18 @@ class InferState:
         self.dtype = dtype
         self.device = device
         self.cpu_dtype = torch.float32
+        # Requires the matching M-DCI dtype=2 gather extension.  It converts
+        # CPU-resident FP32 KV pages into an FP16 pinned staging buffer before
+        # H2D, halving PCIe traffic while keeping the DCI index in FP32.
+        self.fp16_recall = bool(int(
+            os.environ.get("ICECACHE_FP16_RECALL", "0")))
+        if self.fp16_recall and self.dtype is not torch.float16:
+            raise ValueError(
+                "ICECACHE_FP16_RECALL=1 currently requires torch.float16 KV"
+            )
+        self.recall_dtype = self.dtype if self.fp16_recall else self.cpu_dtype
+        if self.fp16_recall:
+            self._validate_fp16_recall_backend()
 
         self.offload_ratio: int = 2  # >= 1
         self.search_ratio: float = 1e-3
@@ -138,6 +150,8 @@ class InferState:
         self._u8 = dict(dtype=torch.uint8, device=self.device)
         self._fp = dict(dtype=self.dtype, device=self.device)
         self._cfp = dict(dtype=self.cpu_dtype, device=torch.device("cpu"))
+        self._recall_fp = dict(
+            dtype=self.recall_dtype, device=torch.device("cpu"))
         self._ci32 = dict(dtype=torch.int32, device=torch.device("cpu"))
         self._cb = dict(dtype=torch.bool, device=torch.device("cpu"))
 
@@ -332,6 +346,31 @@ class InferState:
     @property
     def batch_size(self):
         return self.kv_caches[0].batch_size
+
+    @staticmethod
+    def _validate_fp16_recall_backend():
+        """Fail closed when dtype=2 is unavailable in the M-DCI extension."""
+        source = np.array([1.5, -2.0], dtype=np.float32)
+        source_ptr = np.array([source.ctypes.data], dtype=np.uintp)
+        destination = np.full(2, np.nan, dtype=np.float16)
+        DCI.copy_to_buffer(
+            source_ptr,
+            ptr_dest=destination.ctypes.data,
+            list_size=1,
+            update_num=1,
+            offset_s=1,
+            offset_t=1,
+            dim=1,
+            page_size=1,
+            dtype=2,
+        )
+        if not np.array_equal(
+            destination, source.astype(np.float16), equal_nan=False
+        ):
+            raise RuntimeError(
+                "ICECACHE_FP16_RECALL=1 requires the M-DCI dtype=2 "
+                "FP32-to-FP16 gather patch"
+            )
     
     def check_reuse(self, cur_id, start=2):
         if self.n_reuse_layers == 0 or cur_id <= start:
@@ -482,7 +521,7 @@ class InferState:
                 [self.batch_size, 
                 2 * self.n_kv_heads * (self.layer2budget[-1] - self.n_sink_pages - self.n_win_pages) * self.n_reuse_layers,
                 self.page_size * self.head_dim],
-                **self._cfp,
+                **self._recall_fp,
                 pin_memory=True
             )
             self.cuda_transit_buffer = torch.empty(
@@ -498,7 +537,7 @@ class InferState:
                 [self.batch_size, 
                 2 * self.n_kv_heads * (self.layer2budget[-1] - self.n_sink_pages - self.n_win_pages),
                 self.page_size * self.head_dim],
-                **self._cfp,
+                **self._recall_fp,
                 pin_memory=True
             )
             self.cuda_transit_buffer = torch.empty(
@@ -511,7 +550,7 @@ class InferState:
             self._src_address_buffer = np.zeros(self.n_kv_heads * (self.layer2budget[-1] - self.n_sink_pages - self.n_win_pages), dtype=np.int64)
 
         
-        if self.dtype is not torch.float32:
+        if self.dtype is not torch.float32 and not self.fp16_recall:
             self.cuda_cast_buffer = torch.empty(
                 [self.batch_size, 2 * self.n_kv_heads * (self.layer2budget[-1] - self.n_sink_pages - self.n_win_pages),
                     self.page_size * self.head_dim],
@@ -697,6 +736,7 @@ class InferState:
             "recall_calls_per_token": self.profile_recall_calls / measured if measured else None,
             "recall_pages_per_token": self.profile_recall_pages / measured if measured else None,
             "index_update_calls": self.profile_index_update_calls,
+            "fp16_recall": self.fp16_recall,
             "cross_token_reuses": self.profile_cross_token_reuses,
             "cross_token_reuse_calls": self.profile_cross_token_reuse_calls,
             "cross_token_reuse_share": (
@@ -1202,7 +1242,9 @@ class InferState:
                                list_size=counter, update_num=self.page_size,
                                offset_s=self.n_kv_heads*self.page_size*self.head_dim,
                                offset_t=n_transit_pages*self.page_size*self.head_dim,
-                               dim=self.head_dim, page_size=self.page_size*self.head_dim, dtype=0)
+                               dim=self.head_dim,
+                               page_size=self.page_size*self.head_dim,
+                               dtype=2 if self.fp16_recall else 0)
         if gather_start is not None:
             self.profile_recall_gather_seconds += perf_counter() - gather_start
             self.profile_recall_calls += 1

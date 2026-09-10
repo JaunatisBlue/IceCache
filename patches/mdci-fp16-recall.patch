@@ -1,0 +1,52 @@
+diff --git a/src/py_dci.c b/src/py_dci.c
+index 59d0832..9b7a180 100644
+--- a/src/py_dci.c
++++ b/src/py_dci.c
+@@ -30,6 +30,20 @@
+ #include <stdbool.h>
+ _Static_assert(sizeof(bool) == 1, "C bool must be 1 byte to alias NPY_BOOL");
+ 
++static inline void fp32_to_fp16(uint16_t *dst, const float *src, size_t n) {
++    size_t j = 0;
++    for (; j + 8 <= n; j += 8) {
++        __m256 values = _mm256_loadu_ps(src + j);
++        __m128i halves = _mm256_cvtps_ph(
++            values, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
++        _mm_storeu_si128((__m128i *)(dst + j), halves);
++    }
++    for (; j < n; ++j) {
++        dst[j] = _cvtss_sh(
++            src[j], _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
++    }
++}
++
+ #if PY_MAJOR_VERSION >= 3
+ #define PY3K
+ #endif
+@@ -2384,7 +2398,9 @@ static PyObject *copy_to_buffer(PyObject *self, PyObject *args) {
+     PyArrayObject *py_src_ptr_array;
+     int list_size, update_num;
+     unsigned long long ptr_dest;
+-    int offset_s, offset_t, dim, page_size, dtype;  // dtype: 0 = float32, 1 = float16
++    int offset_s, offset_t, dim, page_size, dtype;
++    // dtype: 0 = float32 memcpy, 1 = float16 memcpy,
++    //        2 = float32 source converted to IEEE float16 destination
+ 
+     if (!PyArg_ParseTuple(args, "O!Kiiiiiii", &PyArray_Type, &py_src_ptr_array, &ptr_dest, &list_size, &update_num,
+                           &offset_s, &offset_t, &dim, &page_size, &dtype)) return NULL;
+@@ -2413,6 +2429,15 @@ static PyObject *copy_to_buffer(PyObject *self, PyObject *args) {
+             size_t copy_len = update_num * dim;
+             memcpy(current_dest_page, current_src_page, copy_len * sizeof(uint16_t));
+             memcpy(current_dest_page + offset_t, current_src_page + offset_s, copy_len * sizeof(uint16_t));
++        } else if (dtype == 2) {  // float32 -> float16
++            uint16_t* p_dest = (uint16_t*)(uintptr_t)ptr_dest;
++            float* current_src_page = (float*)src_addr;
++            uint16_t* current_dest_page = p_dest + i * page_size;
++
++            size_t copy_len = update_num * dim;
++            fp32_to_fp16(current_dest_page, current_src_page, copy_len);
++            fp32_to_fp16(current_dest_page + offset_t,
++                         current_src_page + offset_s, copy_len);
+         }
+     }
+ 

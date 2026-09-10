@@ -102,6 +102,28 @@ python3 setup.py install
 
 See the [M-DCI README](https://github.com/yuzhenmao/M-DCI) for build prerequisites (OpenBLAS / Apple Accelerate, OpenMP) and troubleshooting.
 
+For the optional FP16 recall staging path, apply and install the bundled
+M-DCI patch from the repository root:
+
+```bash
+scripts/install_mdci_fp16_recall.sh /path/to/M-DCI
+```
+
+Enable it with `ICECACHE_FP16_RECALL=1`. IceCache validates the native
+extension at startup and fails with a clear error if the required conversion
+path is missing. This keeps the CPU DCI index in FP32, converts selected pages
+to FP16 in pinned host memory, and halves their CPU-to-GPU transfer volume.
+
+On a single long-running request, match OpenMP workers to physical CPU cores
+to avoid SMT oversubscription. For a 32-core/64-thread dual-socket host:
+
+```bash
+OMP_NUM_THREADS=32 OMP_PROC_BIND=spread OMP_PLACES=cores \
+ICECACHE_DCI_PARALLEL_LEVEL=2 ICECACHE_FP16_RECALL=1 python ...
+```
+
+Thread affinity is hardware-specific; benchmark it on the target host.
+
 ## Running Benchmarks
 
 All benchmark scripts are in `IceCache/benchmark/`.
