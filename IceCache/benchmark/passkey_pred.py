@@ -86,7 +86,8 @@ def passkey_retrieval_test(
     answer_ids = tokenizer(answer, return_tensors="pt").input_ids[:, 1:]  # drop BOS
     # answer_ids = tokenizer(answer, return_tensors="pt").input_ids[:, :]  # drop BOS
     context_length = inputs.input_ids.shape[-1]
-    max_new_tokens = answer_ids.shape[-1] + 1
+    print(f"Context length: {context_length}")
+    max_new_tokens = args.profile_new_tokens or answer_ids.shape[-1] + 1
     if use_3_stages_gen:
         context_length += q_input_ids.shape[-1]
         max_new_tokens += q_input_ids.shape[-1]
@@ -103,7 +104,7 @@ def passkey_retrieval_test(
 
     timer = TimingCriteria()
 
-    output = model.generate(
+    generate_kwargs = dict(
         **inputs,
         max_new_tokens=max_new_tokens,
         do_sample=False,
@@ -111,13 +112,23 @@ def passkey_retrieval_test(
         pad_token_id=tokenizer.eos_token_id,
         stopping_criteria=StoppingCriteriaList([timer])
     )
+    if args.profile_new_tokens:
+        generate_kwargs["min_new_tokens"] = args.profile_new_tokens
+    output = model.generate(**generate_kwargs)
 
     token_latencies = [t2 - t1 for t1, t2 in zip(timer.timings, timer.timings[1:])]
     print(f"Prefill latencies: {token_latencies[0]+token_latencies[1]}, Decode latencies: {np.mean(token_latencies[2:])}")
 
-    model_answer = output[0, -answer_ids.shape[-1] :].cpu()
+    generated_text = tokenizer.decode(output[0, context_length:], skip_special_tokens=True)
+    if args.profile_new_tokens:
+        # Profiling forces extra tokens after the answer, so the original
+        # "last answer tokens" check is no longer meaningful.
+        model_answer = output[0, context_length : context_length + answer_ids.shape[-1]].cpu()
+        is_correct = generated_text.lstrip().startswith(answer)
+    else:
+        model_answer = output[0, -answer_ids.shape[-1] :].cpu()
+        is_correct = (model_answer == answer_ids[0]).all().item()
     print(f"The correct answer is {tokenizer.decode(answer_ids[0].cpu())}")
-    is_correct = (model_answer == answer_ids[0]).all().item()
     print(
         f"The model output is '{tokenizer.decode(output[0, context_length:].cpu())}'. The model answer is '{tokenizer.decode(model_answer.cpu())}', is_correct : {is_correct}"
     )
@@ -158,6 +169,7 @@ def parse_args():
         ],
     )
     ap.add_argument("--name", type=str, default="default")
+    ap.add_argument("--model-path", type=str, default=None, help="Optional local model directory overriding the built-in Hugging Face model path.")
     ap.add_argument("--num-tests", type=int, default=20)
     # ap.add_argument(
     #     "--num-garbages", type=int, nargs="+", default=[38000, 76000, 114000]
@@ -177,6 +189,9 @@ def parse_args():
     ap.add_argument("--ratio_2", type=float, default=0.2)
     ap.add_argument("--n_prefetch_layers", type=int, default=0)
     ap.add_argument("--n_reuse_layers", type=int, default=0)
+    ap.add_argument("--profile-dci", action="store_true", help="Report the aggregate steady-state DCI-selection share of decode TPOT.")
+    ap.add_argument("--profile-warmup-tokens", type=int, default=8)
+    ap.add_argument("--profile-new-tokens", type=int, default=0, help="Force this many generated tokens when profiling.")
     ap.add_argument("--debug", action="store_true")
 
     args = ap.parse_args()
@@ -192,7 +207,7 @@ def main():
     # Define model config
     dev = torch.device("cuda")
     model_name: str = args.model
-    path = MODEL_CONFIGS[model_name]["path"]
+    path = args.model_path or MODEL_CONFIGS[model_name]["path"]
     num_tests = args.num_tests
 
     # Load model
@@ -247,6 +262,10 @@ def main():
                 fp,
             )
             fp.write("\n")
+
+    if args.profile_dci:
+        state = model._icecache_infer_state
+        print("DCI_PROFILE " + json.dumps(state.get_profile_stats(), sort_keys=True))
 
 
 if __name__ == "__main__":

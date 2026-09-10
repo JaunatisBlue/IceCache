@@ -31,6 +31,12 @@ def parse_args(cmd_args=None):
         ],
     )
     ap.add_argument("--name", type=str, default="default")
+    ap.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="Optional local model directory overriding longbench_config/model2path.json.",
+    )
     ap.add_argument("--e", action="store_true", help="Evaluate on LongBench-E")
     ap.add_argument("--icecache", action="store_true", help="Enable IceCache")
     ap.add_argument("--page-size", type=int, default=16)
@@ -327,8 +333,9 @@ if __name__ == "__main__":
     model_name = args.model
     # define your model
     max_length = model2maxlen[model_name]
+    model_path = args.model_path or model2path[model_name]
     model, tokenizer = load_model_and_tokenizer(
-        model2path[model_name], model_name, device, args
+        model_path, model_name, device, args
     )
 
     datasets = args.datasets

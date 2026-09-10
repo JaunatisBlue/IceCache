@@ -1,1 +1,3 @@
 IceCache/source/icecache_cpp.*
+experiment/
+__pycache__

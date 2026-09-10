@@ -2,6 +2,7 @@ from typing import List, Union, Dict, Tuple
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
+import os
 from threading import Thread
 import threading
 
@@ -15,7 +16,7 @@ from . import utils
 import icecache_cpp as _cpp
 
 import numpy as np
-from time import time
+from time import time, perf_counter
 from dciknn import DCI
 from tqdm import tqdm
 import copy
@@ -50,6 +51,8 @@ class InferState:
         use_sparse_attn=False,
         n_prefetch_layers=0,
         n_reuse_layers=0,
+        profile_dci=False,
+        profile_warmup_tokens=0,
         group_size=None,
         n_groups=None,
         debug=False,
@@ -74,7 +77,10 @@ class InferState:
         self.search_ratio: float = 1e-3
         self.debug = debug
         self.use_dci = True
-        self.parallel_level = 2
+        # DCI's native parallel query can oversubscribe OpenMP on very long
+        # contexts.  Keep the original default, while allowing launchers to
+        # disable nested parallelism for stable long-running benchmarks.
+        self.parallel_level = int(os.environ.get("ICECACHE_DCI_PARALLEL_LEVEL", "2"))
 
         if n_max_pages is None:
             assert n_max_bytes is not None
@@ -186,6 +192,17 @@ class InferState:
 
         self.n_prefetch_layers = n_prefetch_layers
         self.n_reuse_layers = n_reuse_layers
+        # CUDA events alone would miss the CPU-resident DCI search.  This
+        # wall-clock profiling path is deliberately opt-in.
+        self.profile_dci = profile_dci
+        self.profile_warmup_tokens = profile_warmup_tokens
+        self.profile_decode_steps = 0
+        self.profile_sequence_decode_steps = 0
+        self.profile_measured_steps = 0
+        self.profile_dci_calls = 0
+        self.profile_dci_seconds = 0.0
+        self.profile_decode_seconds = 0.0
+        self._profile_decode_start = None
         self.nn_idx_all = None
         self.attn_layers = [None] * n_layers
 
@@ -274,6 +291,9 @@ class InferState:
             return cur_id-position_in_cycle
 
     def _prepare_prefill(self, bsz, q_len):
+        # Each prompt has its own cache fill and initial recalls, so warm-up
+        # must restart per sequence while aggregate counters remain intact.
+        self.profile_sequence_decode_steps = 0
         self.num_offload_pages = None
         self.n_dci_pages = None
         self.offload_win_flag = [False] * self.n_layers
@@ -465,6 +485,14 @@ class InferState:
 
 
     def _prepare_decode(self, bsz):
+        self.profile_decode_steps += 1
+        self.profile_sequence_decode_steps += 1
+        if self.profile_dci:
+            # Synchronize only for profiling so one measured interval includes
+            # the GPU work and CPU DCI work on the decode critical path.
+            torch.cuda.synchronize(self.device)
+            self._profile_decode_start = perf_counter()
+
         if self.kv_last_page_len + 1 >= self.page_size:  # n_win_pages >= 2
             self.default_stream.wait_stream(self.decode_backup_stream)
             if self.offload_win_flag[-1]:
@@ -520,6 +548,31 @@ class InferState:
     def _finish_decode(self, bsz):
         for handler in self.decode_handler_tab.values():
             handler.end_forward()
+        if self.profile_dci and self._profile_decode_start is not None:
+            torch.cuda.synchronize(self.device)
+            if self.profile_sequence_decode_steps > self.profile_warmup_tokens:
+                self.profile_decode_seconds += perf_counter() - self._profile_decode_start
+                self.profile_measured_steps += 1
+            self._profile_decode_start = None
+
+    def _profile_is_measured_step(self):
+        return self.profile_dci and self.profile_sequence_decode_steps > self.profile_warmup_tokens
+
+    def get_profile_stats(self):
+        """Return aggregate steady-state decode timing statistics in seconds."""
+        measured = self.profile_measured_steps
+        return {
+            "warmup_tokens": self.profile_warmup_tokens,
+            "decode_steps_total": self.profile_decode_steps,
+            "decode_steps_measured": measured,
+            "decode_total_seconds": self.profile_decode_seconds,
+            "dci_select_seconds": self.profile_dci_seconds,
+            "dci_select_calls": self.profile_dci_calls,
+            "decode_tpot_ms": 1000 * self.profile_decode_seconds / measured if measured else None,
+            "dci_select_ms_per_token": 1000 * self.profile_dci_seconds / measured if measured else None,
+            "dci_share": self.profile_dci_seconds / self.profile_decode_seconds if self.profile_decode_seconds else None,
+            "dci_calls_per_token": self.profile_dci_calls / measured if measured else None,
+        }
 
     def begin_forward(self, bsz, q_len):
         if q_len > 1:
@@ -797,8 +850,11 @@ class InferState:
             bsz = 1
 
             num_neighbours = self.n_dci_pages - self.layer2topk[cur_id]
+            # M-DCI terminates the entire process when field_of_view is
+            # smaller than the number of neighbour pages it must expand.
+            # Budget 64 therefore cannot safely use the old minimum of 30.
             query_field_of_view = max(
-                int((self.seq_len) * self.search_ratio), 30)
+                int(self.seq_len * self.search_ratio), num_neighbours, 30)
             query_prop_to_retrieve = 0.8
 
             prev_num_points = self.dci_db[cur_id].num_points[0]
@@ -849,7 +905,14 @@ class InferState:
             head_ids = torch.arange(
                 self.n_kv_heads, device=padded_arrays.device).unsqueeze(1)
 
-            if self.selected_page_idx[cur_id] is None:
+            # The number of recall slots can change while the cache transitions
+            # from prefill to steady-state decoding.  In that case an old page
+            # set has a different width and cannot be diffed against the new
+            # selection.  Treat it as a fresh resident-set initialization.
+            if (
+                self.selected_page_idx[cur_id] is None
+                or self.selected_page_idx[cur_id].shape != nn_idx_0.shape
+            ):
                 # evicted_idx, recall_idx, evict_num
                 ns = kvc.n_sink_pages
                 self.selected_page_idx[cur_id] = nn_idx_0
@@ -940,8 +1003,12 @@ class InferState:
             for i in range(kvc.batch_size):
 
                 if self.check_reuse(layer_idx) == 0:
+                    dci_start = perf_counter() if self._profile_is_measured_step() else None
                     eids, rids, nr = self._DCI_query(
                         i, layer_idx, query_states[i].cpu().detach().transpose(0, 1))
+                    if dci_start is not None:
+                        self.profile_dci_seconds += perf_counter() - dci_start
+                        self.profile_dci_calls += 1
                 
                     self.prev_nr = nr
                     self.prev_eids = eids

@@ -415,5 +415,5 @@ def enable_icecache(
                     mod, *args, infer_state=infer_state, debug=debug, **kwargs
                 )
             )(mod)
-    
+    self._icecache_infer_state = infer_state
     return self
