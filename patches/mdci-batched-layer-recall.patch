@@ -1,0 +1,59 @@
+diff --git a/src/py_dci.c b/src/py_dci.c
+--- a/src/py_dci.c
++++ b/src/py_dci.c
+@@ -2443,6 +2443,47 @@ static PyObject *copy_to_buffer(PyObject *self, PyObject *args) {
+     Py_INCREF(Py_None);
+     return Py_None;
+ }
++
++static PyObject *copy_to_buffer_batched(PyObject *self, PyObject *args) {
++    PyArrayObject *py_src_ptr_array, *py_dest_k_array, *py_dest_v_array;
++    int list_size, offset_s, dim, page_size, dtype;
++    unsigned long long ptr_dest;
++
++    if (!PyArg_ParseTuple(args, "O!O!O!Kiiiii",
++                          &PyArray_Type, &py_src_ptr_array,
++                          &PyArray_Type, &py_dest_k_array,
++                          &PyArray_Type, &py_dest_v_array,
++                          &ptr_dest, &list_size, &offset_s,
++                          &dim, &page_size, &dtype)) return NULL;
++
++    unsigned long long* src_ptr_data =
++        (unsigned long long*)PyArray_DATA(py_src_ptr_array);
++    int32_t* dest_k_data = (int32_t*)PyArray_DATA(py_dest_k_array);
++    int32_t* dest_v_data = (int32_t*)PyArray_DATA(py_dest_v_array);
++    size_t copy_len = (size_t)dim;
++
++#pragma omp parallel for
++    for (int i = 0; i < list_size; ++i) {
++        float* current_src_page =
++            (float*)(uintptr_t)src_ptr_data[i];
++        if (dtype == 2) {
++            uint16_t* destination = (uint16_t*)(uintptr_t)ptr_dest;
++            fp32_to_fp16(destination + (size_t)dest_k_data[i] * page_size,
++                         current_src_page, copy_len);
++            fp32_to_fp16(destination + (size_t)dest_v_data[i] * page_size,
++                         current_src_page + offset_s, copy_len);
++        } else if (dtype == 0) {
++            float* destination = (float*)(uintptr_t)ptr_dest;
++            memcpy(destination + (size_t)dest_k_data[i] * page_size,
++                   current_src_page, copy_len * sizeof(float));
++            memcpy(destination + (size_t)dest_v_data[i] * page_size,
++                   current_src_page + offset_s, copy_len * sizeof(float));
++        }
++    }
++
++    Py_INCREF(Py_None);
++    return Py_None;
++}
+ 
+ static PyObject *reuse_copy_node(PyObject *self, PyObject *args) {
+     PyArrayObject *py_p_index;
+@@ -2841,6 +2882,7 @@ static PyMethodDef py_dci_module_methods[] = {
+     {"_dci_get_parent_stat", py_dci_get_parent_stat, METH_VARARGS, "Get parent statistics for the finest level. Returns (parent_in_anchor_set, distance_ratios, parent_consistency, min_dist_to_anchor_parents, max_dist_closest_parent_to_children)."},
+     {"_dci_check_dci", py_dci_check_dci, METH_VARARGS, "Check the correctness of the DCI instance."},
+     {"_dci_copy_to_buffer", copy_to_buffer, METH_VARARGS, "Copy data to buffer."},
++    {"_dci_copy_to_buffer_batched", copy_to_buffer_batched, METH_VARARGS, "Copy grouped layer pages to one buffer."},
+     {"_dci_reuse_copy_node", reuse_copy_node, METH_VARARGS, "Reuse copy to buffer."},
+     {"_dci_reuse_update_node", reuse_update_node, METH_VARARGS, "Reuse update to buffer."},
+     {"_dci_diff_pages_by_head", diff_pages_by_head, METH_VARARGS, "Diff pages by head."},

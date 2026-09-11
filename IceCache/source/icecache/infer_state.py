@@ -22,6 +22,10 @@ try:
     from dciknn._dci import _dci_first_k_unique_by_head
 except ImportError:
     _dci_first_k_unique_by_head = None
+try:
+    from dciknn._dci import _dci_copy_to_buffer_batched
+except ImportError:
+    _dci_copy_to_buffer_batched = None
 from tqdm import tqdm
 import copy
 from ctypes import c_float, POINTER, cast, c_void_p
@@ -210,6 +214,28 @@ class InferState:
 
         self.n_prefetch_layers = n_prefetch_layers
         self.n_reuse_layers = n_reuse_layers
+        # Page IDs are reused, but every layer still owns different KV data.
+        # This opt-in path gathers a whole reuse group in one OpenMP region
+        # and submits one larger H2D copy.
+        self.batch_layer_recall = bool(int(
+            os.environ.get("ICECACHE_BATCH_LAYER_RECALL", "0")))
+        if self.batch_layer_recall:
+            if self.n_reuse_layers <= 1:
+                raise ValueError(
+                    "ICECACHE_BATCH_LAYER_RECALL=1 requires n_reuse_layers > 1")
+            if not self.fp16_recall:
+                raise ValueError(
+                    "ICECACHE_BATCH_LAYER_RECALL=1 currently requires "
+                    "ICECACHE_FP16_RECALL=1")
+            if self.n_prefetch_layers:
+                raise ValueError(
+                    "ICECACHE_BATCH_LAYER_RECALL=1 is incompatible with "
+                    "layer prefetch in this prototype")
+            if _dci_copy_to_buffer_batched is None:
+                raise RuntimeError(
+                    "ICECACHE_BATCH_LAYER_RECALL=1 requires the matching "
+                    "M-DCI batched-gather extension")
+        self._batched_recall_slices = {}
         # CUDA events alone would miss the CPU-resident DCI search.  This
         # wall-clock profiling path is deliberately opt-in.
         self.profile_dci = profile_dci
@@ -234,6 +260,7 @@ class InferState:
         self.profile_page_metadata_seconds = 0.0
         self.profile_index_update_seconds = 0.0
         self.profile_recall_calls = 0
+        self.profile_recall_submissions = 0
         self.profile_recall_pages = 0
         self.profile_index_update_calls = 0
         self.profile_cross_token_reuses = 0
@@ -638,6 +665,7 @@ class InferState:
 
 
     def _prepare_decode(self, bsz):
+        self._batched_recall_slices.clear()
         self.profile_decode_steps += 1
         self.profile_sequence_decode_steps += 1
         if self.profile_dci:
@@ -744,9 +772,11 @@ class InferState:
             "page_metadata_ms_per_token": 1000 * self.profile_page_metadata_seconds / measured if measured else None,
             "index_update_ms_per_token": 1000 * self.profile_index_update_seconds / measured if measured else None,
             "recall_calls_per_token": self.profile_recall_calls / measured if measured else None,
+            "recall_submissions_per_token": self.profile_recall_submissions / measured if measured else None,
             "recall_pages_per_token": self.profile_recall_pages / measured if measured else None,
             "index_update_calls": self.profile_index_update_calls,
             "fp16_recall": self.fp16_recall,
+            "batch_layer_recall": self.batch_layer_recall,
             "cross_token_reuses": self.profile_cross_token_reuses,
             "cross_token_reuse_calls": self.profile_cross_token_reuse_calls,
             "cross_token_reuse_share": (
@@ -1280,6 +1310,7 @@ class InferState:
         if gather_start is not None:
             self.profile_recall_gather_seconds += perf_counter() - gather_start
             self.profile_recall_calls += 1
+            self.profile_recall_submissions += 1
             self.profile_recall_pages += n_transit_pages
         ############################################################
 
@@ -1291,6 +1322,77 @@ class InferState:
             self.cuda_cast_buffer[:, : 2 * n_transit_pages, :].copy_(
                 dst, non_blocking=True
             )
+
+    def recall_layer_group(self, layer_idx: int, b: int,
+                           rids: Tensor, nr: Tensor):
+        """Gather one layer-reuse group into [L0 K,V | L1 K,V | ...]."""
+        assert self.check_reuse(layer_idx) == 0
+        profile_stage = self._profile_is_measured_step()
+        gather_start = perf_counter() if profile_stage else None
+
+        layers = [layer_idx]
+        for candidate in range(layer_idx + 1,
+                               min(layer_idx + self.n_reuse_layers,
+                                   self.n_layers)):
+            if self.check_reuse(candidate) != layer_idx:
+                break
+            if (self.layer2budget[candidate] != self.layer2budget[layer_idx]
+                    or self.kv_caches[candidate].n_real_pages
+                    != self.kv_caches[candidate].budget):
+                break
+            layers.append(candidate)
+
+        rids_cpu = rids.cpu()
+        nr_cpu = nr.cpu()
+        pages_per_layer = int(torch.sum(nr_cpu).item())
+        if pages_per_layer == 0:
+            for member in layers:
+                self._batched_recall_slices[member] = (0, 0)
+            return
+
+        total_pages = pages_per_layer * len(layers)
+        dest_k = np.empty(total_pages, dtype=np.int32)
+        dest_v = np.empty(total_pages, dtype=np.int32)
+        counter = 0
+        for group_idx, member in enumerate(layers):
+            layer_start = 2 * group_idx * pages_per_layer
+            self._batched_recall_slices[member] = (
+                layer_start, 2 * pages_per_layer)
+            local_page = 0
+            for head_idx in range(self.n_kv_heads):
+                count = int(nr_cpu[head_idx].item())
+                if count:
+                    end = counter + count
+                    self._src_address_buffer[counter:end] = (
+                        self.page_address_buffer[member][
+                            b, head_idx, rids_cpu[head_idx, :count]])
+                    page_ids = np.arange(
+                        local_page, local_page + count, dtype=np.int32)
+                    dest_k[counter:end] = layer_start + page_ids
+                    dest_v[counter:end] = (
+                        layer_start + pages_per_layer + page_ids)
+                    counter = end
+                    local_page += count
+
+        with torch.cuda.stream(self.c2g_stream):
+            _dci_copy_to_buffer_batched(
+                self._src_address_buffer, dest_k, dest_v,
+                cast(self.cpu_transit_buffer[b].data_ptr(), c_void_p).value,
+                counter,
+                self.n_kv_heads * self.page_size * self.head_dim,
+                self.page_size * self.head_dim,
+                self.page_size * self.head_dim,
+                2,
+            )
+            width = 2 * total_pages
+            self.cuda_transit_buffer[:, :width, :].copy_(
+                self.cpu_transit_buffer[:, :width, :], non_blocking=True)
+
+        if gather_start is not None:
+            self.profile_recall_gather_seconds += perf_counter() - gather_start
+            self.profile_recall_calls += len(layers)
+            self.profile_recall_submissions += 1
+            self.profile_recall_pages += total_pages
 
     async def estimate_select_recall_wrapper(self, layer_idx: int, query_states: Tensor):
         return await self._loop.run_in_executor(self._loop_executor, self.estimate_select_recall, layer_idx, query_states)
@@ -1360,8 +1462,12 @@ class InferState:
                     assert eids is not None and nr is not None and rids is not None
 
                 if eids is not None and not cross_token_reused:
-
-                    self.recall(layer_idx, i, rids, nr)
+                    if (self.batch_layer_recall
+                            and self.check_reuse(layer_idx) == 0):
+                        self.recall_layer_group(layer_idx, i, rids, nr)
+                    elif (not self.batch_layer_recall
+                          or layer_idx not in self._batched_recall_slices):
+                        self.recall(layer_idx, i, rids, nr)
 
                     metadata_start = (
                         perf_counter() if self._profile_is_measured_step()
@@ -1389,8 +1495,11 @@ class InferState:
         return eids, nr
 
     def scatter_pages(self, layer_idx, eids, nr):
-
-        _cpp.scatter_pages(self.cuda_cast_buffer, 
+        transit = self.cuda_cast_buffer
+        if self.batch_layer_recall and layer_idx in self._batched_recall_slices:
+            start, width = self._batched_recall_slices[layer_idx]
+            transit = transit[:, start:start + width, :]
+        _cpp.scatter_pages(transit,
                            self.kv_caches[layer_idx].pool.buffer,
                            eids, nr)
 

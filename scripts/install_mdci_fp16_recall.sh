@@ -11,6 +11,8 @@ mdci_root="$(cd "$1" && pwd)"
 
 git -C "$mdci_root" apply --check "$repo_root/patches/mdci-fp16-recall.patch"
 git -C "$mdci_root" apply "$repo_root/patches/mdci-fp16-recall.patch"
+git -C "$mdci_root" apply --check "$repo_root/patches/mdci-batched-layer-recall.patch"
+git -C "$mdci_root" apply "$repo_root/patches/mdci-batched-layer-recall.patch"
 python -m pip install --no-build-isolation --no-deps --force-reinstall "$mdci_root"
 
-echo "Installed patched M-DCI. Enable with ICECACHE_FP16_RECALL=1."
+echo "Installed patched M-DCI. Enable with ICECACHE_FP16_RECALL=1; optionally add ICECACHE_BATCH_LAYER_RECALL=1."
