@@ -117,18 +117,18 @@ The same patch also fuses ordered GQA candidate merging into the native
 extension; IceCache detects that symbol automatically and otherwise falls
 back to the portable NumPy/Python path.
 
-With `--n_reuse_layers 3`, `ICECACHE_BATCH_LAYER_RECALL=1` additionally
-gathers the three layers' distinct KV pages in one native OpenMP region and
-one larger H2D submission. It requires `ICECACHE_FP16_RECALL=1`. This reuses
-only page IDs: every layer still reads and scatters its own KV contents.
+An experimental `ICECACHE_BATCH_LAYER_RECALL=1` path gathers the distinct KV
+pages of a three-layer reuse group in one native OpenMP region and one larger
+H2D submission. It requires `ICECACHE_FP16_RECALL=1` and reuses only page IDs.
+It is not recommended for the full `page_topks=0` recall load, where the loss
+of per-layer copy/compute overlap outweighed the lower submission count.
 
 On a single long-running request, match OpenMP workers to physical CPU cores
 to avoid SMT oversubscription. For a 32-core/64-thread dual-socket host:
 
 ```bash
 OMP_NUM_THREADS=32 OMP_PROC_BIND=spread OMP_PLACES=cores \
-ICECACHE_DCI_PARALLEL_LEVEL=2 ICECACHE_FP16_RECALL=1 \
-ICECACHE_BATCH_LAYER_RECALL=1 python ...
+ICECACHE_DCI_PARALLEL_LEVEL=2 ICECACHE_FP16_RECALL=1 python ...
 ```
 
 Thread affinity is hardware-specific; benchmark it on the target host.
