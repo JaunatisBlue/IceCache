@@ -53,6 +53,8 @@ def parse_args(cmd_args=None):
     ap.add_argument("--ratio_2", type=float, default=0.2)
     ap.add_argument("--n_prefetch_layers", type=int, default=0)
     ap.add_argument("--n_reuse_layers", type=int, default=0)
+    ap.add_argument("--profile-dci", action="store_true")
+    ap.add_argument("--profile-warmup-tokens", type=int, default=2)
     ap.add_argument(
         "--max-samples", type=int, default=None,
         help="Run a deterministic length-stratified subset of each dataset.",
@@ -315,6 +317,19 @@ def get_pred(
                 )
             os.replace(trace_tmp_path, trace_path)
 
+        adaptive_path = os.environ.get("ICECACHE_TRACE_DCI_ADAPTIVE_PATH")
+        if adaptive_path and hasattr(model, "_icecache_infer_state"):
+            adaptive_tmp_path = adaptive_path + ".tmp"
+            with open(adaptive_tmp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    model._icecache_infer_state.get_dci_adaptive_stats(),
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            os.replace(adaptive_tmp_path, adaptive_path)
+
         if use_3_stages_gen:
             generate.reset_q_input_ids()
 
@@ -406,3 +421,11 @@ if __name__ == "__main__":
         state = model._icecache_infer_state
         print("DCI_CHURN " + json.dumps(
             state.get_dci_churn_stats(), sort_keys=True))
+    if args.icecache and bool(int(os.environ.get("ICECACHE_TRACE_DCI_ADAPTIVE", "0"))):
+        state = model._icecache_infer_state
+        print("DCI_ADAPTIVE " + json.dumps(
+            state.get_dci_adaptive_stats(), sort_keys=True))
+    if args.icecache and args.profile_dci:
+        state = model._icecache_infer_state
+        print("DCI_PROFILE " + json.dumps(
+            state.get_profile_stats(), sort_keys=True))

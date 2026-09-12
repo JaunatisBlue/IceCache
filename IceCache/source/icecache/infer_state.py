@@ -3,6 +3,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import os
+import atexit
 from threading import Thread
 import threading
 
@@ -76,6 +77,13 @@ class InferState:
         self.head_dim = head_dim
         self.ratio_1 = ratio_1
         self.ratio_2 = ratio_2
+        # Optional layerwise M-DCI tree schedule.  Layers before the boundary
+        # retain ratio_1; layers at/after it use the alternate promotion rate.
+        # Disabled by default so existing runs are unchanged.
+        self.promotion_fast_start_layer = int(os.environ.get(
+            "ICECACHE_PROMOTION_FAST_START_LAYER", "-1"))
+        self.promotion_fast_ratio = float(os.environ.get(
+            "ICECACHE_PROMOTION_FAST_RATIO", str(ratio_1)))
 
         self.dtype = dtype
         self.device = device
@@ -126,6 +134,15 @@ class InferState:
             )
 
         self.page_size = page_size
+        # Experiment 10: layer-sensitivity skip list.  A comma-separated set of
+        # anchor layer indices; those layers reuse the previous selection
+        # (prev_eids) instead of running DCI+recall, to measure which layers
+        # can be skipped without quality loss.  Empty by default (no-op).
+        _skip_env = os.environ.get("ICECACHE_SKIP_DCI_LAYERS", "")
+        self.skip_dci_layers = set(
+            int(x) for x in _skip_env.split(",") if x.strip())
+        self._in_estimate = False
+        self._decode_phase = False
         self.n_max_pages = n_max_pages
         self.n_max_cpu_pages = n_max_cpu_pages
         self.layer2budget = page_budgets
@@ -251,6 +268,8 @@ class InferState:
         # crosses between GPU, CPU search, page metadata, and KV transfer.
         self.profile_query_d2h_seconds = 0.0
         self.profile_native_query_seconds = 0.0
+        self.profile_native_query_seconds_by_layer = defaultdict(float)
+        self.profile_native_query_calls_by_layer = defaultdict(int)
         self.profile_query_postprocess_seconds = 0.0
         self.profile_query_dedup_seconds = 0.0
         self.profile_query_mapping_seconds = 0.0
@@ -267,6 +286,31 @@ class InferState:
         self.profile_cross_token_reuse_calls = 0
         self.profile_cross_token_boundary_refreshes = 0
         self._profile_decode_start = None
+
+        # === ICECACHE_DIAG: joint diagnostic (timing split + address mergeability) ===
+        # Pure-additive, opt-in.  When ICECACHE_DIAG is unset this whole block
+        # costs two bool checks per recall and changes no numerical behaviour.
+        self.diag_enabled = bool(int(os.environ.get("ICECACHE_DIAG", "0")))
+        self.diag_dump_path = os.environ.get("ICECACHE_DIAG_DUMP", "")
+        self.diag_max_records = int(
+            os.environ.get("ICECACHE_DIAG_MAX_RECORDS", "400"))
+        # Bound the number of CUDA events created so a long run cannot
+        # accumulate unbounded event objects.
+        self.diag_event_budget = int(
+            os.environ.get("ICECACHE_DIAG_MAX_EVENTS", "800"))
+        self.diag_addr_prep_seconds = 0.0
+        self.diag_copy_buffer_seconds = 0.0
+        self.diag_h2d_ms = 0.0
+        self.diag_cast_ms = 0.0
+        self.diag_h2d_count = 0
+        self.diag_cast_count = 0
+        self.diag_records = []
+        self.diag_pending = []
+        self.diag_saved = False
+        # [ICECACHE-FASTADDR] vectorised source-address construction (A/B gate)
+        self.fast_addr = bool(int(os.environ.get("ICECACHE_FAST_ADDR", "1")))
+        if self.diag_enabled:
+            atexit.register(self._save_diag)
         self.nn_idx_all = None
         self.attn_layers = [None] * n_layers
 
@@ -282,6 +326,38 @@ class InferState:
         self._trace_exact = []
         self._trace_by_layer = defaultdict(list)
         self._trace_by_head = defaultdict(list)
+
+        # Oracle-only feasibility trace for query-adaptive early termination.
+        # Partial-budget queries are compared with the unchanged full query;
+        # only the full result is used by inference.
+        self.trace_dci_adaptive = bool(int(
+            os.environ.get("ICECACHE_TRACE_DCI_ADAPTIVE", "0")))
+        self.trace_dci_adaptive_levels = tuple(
+            float(x) for x in os.environ.get(
+                "ICECACHE_TRACE_DCI_LEVELS", "0.125,0.25,0.5,1.0"
+            ).split(",")
+        )
+        self.trace_dci_adaptive_thresholds = tuple(
+            float(x) for x in os.environ.get(
+                "ICECACHE_TRACE_DCI_THRESHOLDS", "0.8,0.9,0.95"
+            ).split(",")
+        )
+        self._adaptive_fixed_recall = defaultdict(list)
+        self._adaptive_stop_fraction = defaultdict(list)
+        self._adaptive_oracle_recall = defaultdict(list)
+        self._adaptive_stage_seconds = defaultdict(float)
+        self._adaptive_stage_calls = defaultdict(int)
+
+        # Decode-path DCI visit budget.  M-DCI caps the number of projected
+        # points it expands per level with
+        #   num_projs_to_visit = max(num_to_visit*num_simp,
+        #                            prop_to_visit*num_points*num_simp)
+        # IceCache historically pins prop_to_visit=1.0 (visit everything),
+        # which makes M-DCI's budget parameter dead.  Exposing it here lets
+        # us unlock partial-budget search (e.g. 0.25 = visit 25% of points).
+        self.dci_prop_to_visit = float(
+            os.environ.get("ICECACHE_DCI_PROP_TO_VISIT", "1.0"))
+        assert 0.0 < self.dci_prop_to_visit <= 1.0
 
         # Cross-token event-driven DCI gate.  When the layer's query vector
         # hasn't moved much since the last DCI call, we skip the search and
@@ -407,6 +483,20 @@ class InferState:
             )
     
     def check_reuse(self, cur_id, start=2):
+        # Experiment 10: layer on the skip list is forced to reuse the previous
+        # anchor layer's selection (falls through the cross-layer reuse branch
+        # below, which handles the c2p offset + recall safely).  Only applied
+        # once the previous anchor's DCI tree exists (decode phase); during
+        # prefill the trees are still being built, so fall back to normal.
+        if cur_id in getattr(self, "skip_dci_layers", set()):
+            if cur_id > start:
+                reuse_id = cur_id - self.n_reuse_layers
+                if (getattr(self, "_in_estimate", False)
+                        and getattr(self, "_decode_phase", False)
+                        and threading.get_ident() == getattr(
+                            self, "_estimate_thread", None)):
+                    return reuse_id
+            return 0
         if self.n_reuse_layers == 0 or cur_id <= start:
             return 0
         position = cur_id - start
@@ -461,6 +551,7 @@ class InferState:
     def _prepare_prefill(self, bsz, q_len):
         # Each prompt has its own cache fill and initial recalls, so warm-up
         # must restart per sequence while aggregate counters remain intact.
+        self._decode_phase = False
         self.profile_sequence_decode_steps = 0
         # Cross-token gate state is per-sequence; reset on each new prompt.
         for i in range(self.n_layers):
@@ -614,7 +705,11 @@ class InferState:
             self.dci_db = [None] * self.n_layers
             for i in range(self.n_layers):
                 if self.layer2budget[i] and self.check_reuse(i) == 0:
-                    self.dci_db[i] = DCI(self.head_dim, 1, 1, promotion_prob=self.ratio_1, promotion_prob_subseq=self.ratio_2, num_points=q_len, init=True, num_inst=self.n_kv_heads, debug=self.debug, transform=True, parallel_level=self.parallel_level, proj_vec=proj_vec)
+                    promotion_prob = self.ratio_1
+                    if (self.promotion_fast_start_layer >= 0
+                            and i >= self.promotion_fast_start_layer):
+                        promotion_prob = self.promotion_fast_ratio
+                    self.dci_db[i] = DCI(self.head_dim, 1, 1, promotion_prob=promotion_prob, promotion_prob_subseq=self.ratio_2, num_points=q_len, init=True, num_inst=self.n_kv_heads, debug=self.debug, transform=True, parallel_level=self.parallel_level, proj_vec=proj_vec)
 
         qo_indptr = torch.arange(0, bsz * q_len + 1, q_len, **self._i32)
         self.prefill_handler.begin_forward(
@@ -665,6 +760,7 @@ class InferState:
 
 
     def _prepare_decode(self, bsz):
+        self._decode_phase = True
         self._batched_recall_slices.clear()
         self.profile_decode_steps += 1
         self.profile_sequence_decode_steps += 1
@@ -746,6 +842,66 @@ class InferState:
     def _profile_is_measured_step(self):
         return self.profile_dci and self.profile_sequence_decode_steps > self.profile_warmup_tokens
 
+    def _diag_collect(self, layer_idx, b, rids_cpu, nr_cpu):
+        # [ICECACHE-DIAG] record the selected leaf ids + their real CPU
+        # addresses, per (layer, head).  Only the first
+        # diag_max_records recalls are kept, so the dump stays tiny.
+        if len(self.diag_records) >= self.diag_max_records:
+            return
+        for i in range(self.n_kv_heads):
+            cnt = int(nr_cpu[i])
+            if cnt <= 0:
+                continue
+            leaves = np.asarray(rids_cpu[i, :cnt]).astype(np.int64)
+            addrs = self.page_address_buffer[layer_idx][
+                b, i, leaves].astype(np.uint64)
+            self.diag_records.append((layer_idx, i, leaves, addrs))
+        if (len(self.diag_records) >= self.diag_max_records
+                and not self.diag_saved):
+            self._save_diag()
+
+    def _save_diag(self):
+        if not self.diag_enabled:
+            return
+        path = self.diag_dump_path or os.path.join(
+            os.getcwd(), "icecache_diag.npz")
+        try:
+            if self.diag_records:
+                layer = np.asarray(
+                    [r[0] for r in self.diag_records], dtype=np.int32)
+                head = np.asarray(
+                    [r[1] for r in self.diag_records], dtype=np.int32)
+                flat_leaf = np.concatenate([r[2] for r in self.diag_records])
+                flat_addr = np.concatenate([r[3] for r in self.diag_records])
+                offs = np.zeros(len(self.diag_records) + 1, dtype=np.int64)
+                for k, r in enumerate(self.diag_records):
+                    offs[k + 1] = offs[k] + len(r[2])
+            else:
+                layer = np.zeros(0, np.int32)
+                head = np.zeros(0, np.int32)
+                flat_leaf = np.zeros(0, np.int64)
+                flat_addr = np.zeros(0, np.uint64)
+                offs = np.zeros(1, np.int64)
+            np.savez(
+                path, layer=layer, head=head, flat_leaf=flat_leaf,
+                flat_addr=flat_addr, offsets=offs,
+                addr_prep_seconds=self.diag_addr_prep_seconds,
+                copy_buffer_seconds=self.diag_copy_buffer_seconds,
+                h2d_ms=self.diag_h2d_ms, cast_ms=self.diag_cast_ms,
+                h2d_count=self.diag_h2d_count,
+                cast_count=self.diag_cast_count)
+            self.diag_saved = True
+            print("[ICECACHE-DIAG] records=%d -> %s" % (
+                len(self.diag_records), path))
+            print("[ICECACHE-DIAG] addr_prep_s=%.4f copy_buffer_s=%.4f "
+                  "h2d_ms=%.3f cast_ms=%.3f h2d_n=%d cast_n=%d" % (
+                      self.diag_addr_prep_seconds,
+                      self.diag_copy_buffer_seconds,
+                      self.diag_h2d_ms, self.diag_cast_ms,
+                      self.diag_h2d_count, self.diag_cast_count))
+        except Exception as exc:  # never let diagnostics break a run
+            print("[ICECACHE-DIAG] save failed: %r" % (exc,))
+
     def get_profile_stats(self):
         """Return aggregate steady-state decode timing statistics in seconds."""
         measured = self.profile_measured_steps
@@ -763,6 +919,13 @@ class InferState:
             "dci_calls_per_token": self.profile_dci_calls / measured if measured else None,
             "query_d2h_ms_per_token": 1000 * self.profile_query_d2h_seconds / measured if measured else None,
             "native_query_ms_per_token": 1000 * self.profile_native_query_seconds / measured if measured else None,
+            "native_query_ms_per_call_by_layer": {
+                str(layer): 1000 * seconds
+                / self.profile_native_query_calls_by_layer[layer]
+                for layer, seconds in sorted(
+                    self.profile_native_query_seconds_by_layer.items())
+                if self.profile_native_query_calls_by_layer[layer]
+            },
             "query_postprocess_ms_per_token": 1000 * self.profile_query_postprocess_seconds / measured if measured else None,
             "query_dedup_ms_per_token": 1000 * self.profile_query_dedup_seconds / measured if measured else None,
             "query_mapping_ms_per_token": 1000 * self.profile_query_mapping_seconds / measured if measured else None,
@@ -871,6 +1034,129 @@ class InferState:
             },
         }
 
+    def _raw_dci_to_pages(self, raw_indices, num_neighbours):
+        """Convert raw per-Q-head results into unique per-KV-head pages."""
+        reshaped = raw_indices.reshape(self.n_qo_heads, 2, -1)
+        if self.ratio > 1:
+            if _dci_first_k_unique_by_head is not None:
+                pages = _dci_first_k_unique_by_head(
+                    reshaped, self.n_kv_heads, self.ratio, num_neighbours)
+            else:
+                pages = reshaped[:, 0, :].reshape(
+                    self.n_kv_heads, self.ratio, -1)
+                interleaved = pages.transpose(0, 2, 1).reshape(
+                    self.n_kv_heads, -1)
+                pages = np.vstack([
+                    utils.first_k_unique(row, num_neighbours)
+                    for row in interleaved
+                ])
+        else:
+            pages = reshaped[:, 0, :].reshape(self.n_kv_heads, -1)
+        return np.ascontiguousarray(pages)
+
+    def _trace_adaptive_queries(self, dci_db, query, padding_mask,
+                                num_neighbours, field_of_view,
+                                num_points, full_pages, full_query_seconds):
+        """Measure per-head search convergence without changing inference."""
+        if not self.trace_dci_adaptive:
+            return
+
+        staged_pages = []
+        staged_fractions = []
+        for fraction in self.trace_dci_adaptive_levels:
+            if fraction >= 1.0:
+                pages = full_pages
+                elapsed = full_query_seconds
+            else:
+                visit = max(num_neighbours, int(num_points * fraction))
+                stage_start = perf_counter()
+                raw, _ = dci_db.query(
+                    query,
+                    padding_mask,
+                    num_neighbours=num_neighbours,
+                    field_of_view=field_of_view,
+                    num_to_visit=visit,
+                    num_to_retrieve=-1,
+                    # A negative proportion tells the binding to honor the
+                    # explicit per-stage num_to_visit budget.
+                    prop_to_visit=-1.0,
+                    prop_to_retrieve=0.8,
+                    parallel_level=self.parallel_level,
+                    ratio=self.ratio,
+                )
+                elapsed = perf_counter() - stage_start
+                pages = self._raw_dci_to_pages(raw, num_neighbours)
+            self._adaptive_stage_seconds[str(fraction)] += elapsed
+            self._adaptive_stage_calls[str(fraction)] += 1
+            staged_pages.append(pages)
+            staged_fractions.append(fraction)
+
+        for stage_idx, fraction in enumerate(staged_fractions[:-1]):
+            for head_idx in range(self.n_kv_heads):
+                self._adaptive_fixed_recall[str(fraction)].append(
+                    self._selection_overlap(
+                        staged_pages[stage_idx][head_idx],
+                        full_pages[head_idx]))
+
+        for threshold in self.trace_dci_adaptive_thresholds:
+            key = str(threshold)
+            for head_idx in range(self.n_kv_heads):
+                chosen_idx = len(staged_pages) - 1
+                # Each KV head independently stops when consecutive budgets
+                # produce sufficiently similar page sets.
+                for stage_idx in range(1, len(staged_pages)):
+                    convergence = self._selection_overlap(
+                        staged_pages[stage_idx][head_idx],
+                        staged_pages[stage_idx - 1][head_idx])
+                    if convergence >= threshold:
+                        chosen_idx = stage_idx
+                        break
+                self._adaptive_stop_fraction[key].append(
+                    staged_fractions[chosen_idx])
+                self._adaptive_oracle_recall[key].append(
+                    self._selection_overlap(
+                        staged_pages[chosen_idx][head_idx],
+                        full_pages[head_idx]))
+
+    def get_dci_adaptive_stats(self):
+        def summarize(values):
+            values = np.asarray(values, dtype=np.float64)
+            if values.size == 0:
+                return None
+            return {
+                "count": int(values.size),
+                "mean": float(values.mean()),
+                "p10": float(np.percentile(values, 10)),
+                "p50": float(np.percentile(values, 50)),
+                "p90": float(np.percentile(values, 90)),
+            }
+
+        adaptive = {}
+        for threshold, recalls in self._adaptive_oracle_recall.items():
+            recall_array = np.asarray(recalls, dtype=np.float64)
+            adaptive[threshold] = {
+                "stop_fraction": summarize(
+                    self._adaptive_stop_fraction[threshold]),
+                "oracle_recall": summarize(recalls),
+                "share_recall_ge_90pct": float(np.mean(
+                    recall_array >= 0.9)),
+                "share_recall_ge_95pct": float(np.mean(
+                    recall_array >= 0.95)),
+            }
+        return {
+            "levels": self.trace_dci_adaptive_levels,
+            "stage_mean_ms_per_layer_query": {
+                key: 1000 * seconds / self._adaptive_stage_calls[key]
+                for key, seconds in self._adaptive_stage_seconds.items()
+                if self._adaptive_stage_calls[key]
+            },
+            "fixed_fraction_oracle_recall": {
+                key: summarize(values)
+                for key, values in self._adaptive_fixed_recall.items()
+            },
+            "adaptive": adaptive,
+        }
+
     def begin_forward(self, bsz, q_len):
         if q_len > 1:
             self._prepare_prefill(bsz, q_len)
@@ -884,6 +1170,20 @@ class InferState:
             self._finish_decode(bsz)
 
     def _DCI_first_call(self, b, cur_id, query_states, key_states, value_states, projected):
+        #######   DCI Inst Construction   #######
+        # Experiment 10: tree construction must always happen, regardless of
+        # the skip list (a skipped layer still needs its own DCI tree for the
+        # cross-layer reuse of other layers to address pages).  Guard the
+        # whole method so skip-forcing in check_reuse never applies here.
+        _prev_in_est = getattr(self, "_in_estimate", False)
+        self._in_estimate = False
+        try:
+            return self._DCI_first_call_impl(
+                b, cur_id, query_states, key_states, value_states, projected)
+        finally:
+            self._in_estimate = _prev_in_est
+
+    def _DCI_first_call_impl(self, b, cur_id, query_states, key_states, value_states, projected):
         #######   DCI Inst Construction   #######
         if self.use_dci:
             dci_len = key_states.shape[1]
@@ -1157,9 +1457,13 @@ class InferState:
             query_prop_to_retrieve = 0.8
 
             prev_num_points = self.dci_db[cur_id].num_points[0]
-            num_to_visit = prev_num_points
+            # NOTE: M-DCI takes max(num_to_visit, prop_to_visit*num_points)
+            # as the visit budget, so num_to_visit MUST be <= the prop
+            # budget or prop_to_visit is swallowed.  Keep both consistent.
+            num_to_visit = max(
+                int(prev_num_points * self.dci_prop_to_visit), 1)
             num_to_retrieve = -1
-            prop_to_visit = 1.0
+            prop_to_visit = self.dci_prop_to_visit
             padding_mask = np.ones(
                 [bsz, self.n_qo_heads, 1], dtype=np.bool_).reshape(-1)
 
@@ -1170,7 +1474,8 @@ class InferState:
 
             assert (_query.flags['C_CONTIGUOUS'])
 
-            native_query_start = perf_counter() if profile_stage else None
+            native_query_start = perf_counter() if (
+                profile_stage or self.trace_dci_adaptive) else None
             nn_idx, _ = self.dci_db[cur_id].query(_query,
                                                 padding_mask,
                                                 num_neighbours=num_neighbours,
@@ -1182,9 +1487,15 @@ class InferState:
                                                 parallel_level=self.parallel_level,
                                                 ratio=self.ratio,
                                             )
-            if native_query_start is not None:
-                self.profile_native_query_seconds += (
-                    perf_counter() - native_query_start)
+            native_query_elapsed = (
+                perf_counter() - native_query_start
+                if native_query_start is not None else 0.0
+            )
+            if profile_stage:
+                self.profile_native_query_seconds += native_query_elapsed
+                self.profile_native_query_seconds_by_layer[cur_id] += (
+                    native_query_elapsed)
+                self.profile_native_query_calls_by_layer[cur_id] += 1
 
             postprocess_start = perf_counter() if profile_stage else None
 
@@ -1221,6 +1532,16 @@ class InferState:
                     perf_counter() - dedup_start)
 
             self._trace_dci_selection(cur_id, nn_idx_0)
+            self._trace_adaptive_queries(
+                self.dci_db[cur_id],
+                _query,
+                padding_mask,
+                num_neighbours,
+                query_field_of_view,
+                prev_num_points,
+                nn_idx_0,
+                native_query_elapsed,
+            )
 
             mapping_start = perf_counter() if profile_stage else None
             padded_arrays = torch.tensor(nn_idx_0, **self._ci32)
@@ -1290,13 +1611,35 @@ class InferState:
 
         n_transit_pages = torch.sum(nr).item()
 
-        rids_cpu = rids.cpu()
-        nr_cpu = nr.cpu()
+        if self.fast_addr:
+            # [ICECACHE-FASTADDR] Build the source-address list from NumPy
+            # views.  The original loop re-converts a torch tensor into a
+            # NumPy index array and calls .item() on every iteration, which
+            # costs hundreds of microseconds per recall and is independent
+            # of how many pages are actually transferred.
+            rids_cpu = rids.cpu().numpy()
+            nr_cpu = nr.cpu().numpy()
+            counter = 0
+            for i in range(self.n_kv_heads):
+                c = int(nr_cpu[i])
+                if c:
+                    self._src_address_buffer[counter:counter + c] = (
+                        self.page_address_buffer[layer_idx][
+                            b, i, rids_cpu[i, :c]])
+                    counter += c
+        else:
+            rids_cpu = rids.cpu()
+            nr_cpu = nr.cpu()
 
-        counter = 0
-        for i in range(self.n_kv_heads):
-            self._src_address_buffer[counter:counter+nr_cpu[i].item()] = self.page_address_buffer[layer_idx][b, i, rids_cpu[i, :nr_cpu[i]]]
-            counter += nr_cpu[i].item()
+            counter = 0
+            for i in range(self.n_kv_heads):
+                self._src_address_buffer[counter:counter+nr_cpu[i].item()] = self.page_address_buffer[layer_idx][b, i, rids_cpu[i, :nr_cpu[i]]]
+                counter += nr_cpu[i].item()
+        # [ICECACHE-DIAG] end of CPU address preparation
+        diag_addr_prep_end = perf_counter() if self.diag_enabled else None
+        if self.diag_enabled and gather_start is not None:
+            self.diag_addr_prep_seconds += (diag_addr_prep_end - gather_start)
+            self._diag_collect(layer_idx, b, rids_cpu, nr_cpu)
 
         with torch.cuda.stream(c2g_stream):
 
@@ -1312,16 +1655,33 @@ class InferState:
             self.profile_recall_calls += 1
             self.profile_recall_submissions += 1
             self.profile_recall_pages += n_transit_pages
+        # [ICECACHE-DIAG] copy_to_buffer segment (CPU-side scattered gather)
+        if self.diag_enabled and diag_addr_prep_end is not None:
+            self.diag_copy_buffer_seconds += (perf_counter() - diag_addr_prep_end)
         ############################################################
 
         with torch.cuda.stream(c2g_stream):
             dst = self.cuda_transit_buffer[:, : 2 * n_transit_pages, :]
             src = self.cpu_transit_buffer[:, : 2 * n_transit_pages, :]
+            # [ICECACHE-DIAG] CUDA-event brackets for H2D and cast segments
+            diag_on = self.diag_enabled and self.diag_event_budget > 0
+            diag_e0 = torch.cuda.Event(enable_timing=True) if diag_on else None
+            diag_e1 = torch.cuda.Event(enable_timing=True) if diag_on else None
+            diag_e2 = torch.cuda.Event(enable_timing=True) if diag_on else None
+            if diag_e0 is not None:
+                diag_e0.record(c2g_stream)
             dst.copy_(src, non_blocking=True)
+            if diag_e1 is not None:
+                diag_e1.record(c2g_stream)
 
             self.cuda_cast_buffer[:, : 2 * n_transit_pages, :].copy_(
                 dst, non_blocking=True
             )
+            if diag_e2 is not None:
+                diag_e2.record(c2g_stream)
+            if diag_e0 is not None:
+                self.diag_pending.append((diag_e0, diag_e1, diag_e2))
+                self.diag_event_budget -= 1
 
     def recall_layer_group(self, layer_idx: int, b: int,
                            rids: Tensor, nr: Tensor):
@@ -1399,6 +1759,15 @@ class InferState:
 
     def estimate_select_recall(self, layer_idx: int, query_states: Tensor):
         thread_id = threading.get_ident()
+        self._in_estimate = True
+        self._estimate_thread = thread_id
+        try:
+            return self._estimate_select_recall_impl(
+                layer_idx, query_states, thread_id)
+        finally:
+            self._in_estimate = False
+
+    def _estimate_select_recall_impl(self, layer_idx, query_states, thread_id):
         if hasattr(self, '_thread_locals') and thread_id in self._thread_locals:
             thread_local = self._thread_locals[thread_id]
 
@@ -1491,6 +1860,14 @@ class InferState:
                 if recall_wait_start is not None:
                     self.profile_recall_wait_seconds += (
                         perf_counter() - recall_wait_start)
+                # [ICECACHE-DIAG] read H2D/cast event timings now the stream drained
+                if self.diag_enabled and self.diag_pending:
+                    for _e0, _e1, _e2 in self.diag_pending:
+                        self.diag_h2d_ms += _e0.elapsed_time(_e1)
+                        self.diag_cast_ms += _e1.elapsed_time(_e2)
+                    self.diag_h2d_count += len(self.diag_pending)
+                    self.diag_cast_count += len(self.diag_pending)
+                    self.diag_pending = []
 
         return eids, nr
 

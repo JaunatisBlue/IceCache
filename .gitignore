@@ -5,3 +5,5 @@ IceCache/benchmark/passkey.jsonl
 IceCache/benchmark/pred/**/baseline_*/
 IceCache/benchmark/pred/**/dci_churn_*/
 IceCache/benchmark/pred/**/xtok_*/
+
+*.bak_*
