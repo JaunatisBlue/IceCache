@@ -77,7 +77,7 @@ _icecache_decode（解码侧 Python 总工作 = 13.37 s，占全程序 75.2 s �
 
 ```bash
 bash experiment/run_cprofile.sh        # cProfile 归属
-python roundtrip_latency.py            # 小传输往返延迟微基准
+python experiment/archive/roundtrip_latency.py            # 小传输往返延迟微基准
 bash experiment/run_perf_profile.sh    # perf（本机符号不可用，留档）
 ```
 
@@ -129,4 +129,38 @@ bash experiment/run_perf_profile.sh    # perf（本机符号不可用，留档�
 
 **优先级：② 双缓冲+event 定序（≈15 ms/token 上限，且是后续一切流水化的前提）→ ③ 分块流水（≈10 ms/token）→ ④ DCI 内核（16.37 ms/token，最大但需动 C）。**
 不要单独删 sync（§5 已证伪）；也不要指望"重叠掉传输"（§7 已证无空间）。
+
+---
+
+## 9. 双缓冲实现（§6 方案②）**第一个版本有正确性 bug，根因已定位并修复**（2026-09-12 晚）
+
+**现象**：DB=1 第一个版本（`apply_double_buffer_patch.py`，P1–P8）在 2 样本同配置下 F1 从 46.43 **掉到 42.86**，TPOT 137.8→123.8 ms（recall_wait 48.5→0.013 ms，host 等待消失，性能达成）。三个"结构等价"变体（DB=1 / +强制 sync / +固定槽 0）都精确 42.86，排除竞态与 event 定序问题。
+
+**定位方法**：在 `scatter_pages` 入口加 env 门控 dump（`ICECACHE_DUMP_TRANSIT=1`，对比 DB=0/DB=1 各 2 样本，各 1770 行 scatter），逐行对齐差分。**决定性证据**：
+- tok 0–28（870 行）DB=0/DB=1 **逐行一致**（选页 eids/nr、传输内容、tr8 全同）；
+- **tok 29 起运动侧先分叉**（9/30 层 `tr8` 不同：层 5-7、14-16、29-31），选页仍同；
+- **tok 30 起选页侧也分叉**（`nr_sum` 275→270 等），此后**永久级联**（30/30 层全错）。
+
+**根因**：P8 的 `scatter_pages` 消费**全局共享** `self._last_slot`（P6 在 recall 末尾写入"最近完成的 recall 的槽位"）。当多层 recall 在不同线程/不同完成时机（executor prefetch、主线程顺序）交错时，**后完成的一层会覆盖 `_last_slot`**，先落后执行的 scatter 因此读到**别的层**的槽位数据 → 把错层 KV scatter 进 cache → 下一 token 的 DCI 基于污染 KV 选页 → 级联。tok 29 的 9/30 层（5-7/14-16/29-31）恰好是**并发窗口内被覆盖的层**，不是随机内存损坏而是**共享可变状态竞态**。
+（`estimate_select_recall` 在主线程同步调用时本无竞态，但 `scatter_pages` 读 `_last_slot` 与 recall 写 `_last_slot` 之间隔着 executor 的 `_dci_future`/prefetch 线程，窗口真实存在。）
+
+**验证结果（2 样本同配置，确定性）**：
+| 配置 | TPOT ms | recall_wait ms | F1 |
+|---|---:|---:|---:|
+| DB=0（基线） | 149.9 | 48.65 | **46.43** |
+| DB=1 原版（bug） | 123.8 | 0.013 | 42.86 |
+| DB=1 + fix2 **✅** | 121.9 | 0.0135 | **46.43** |
+
+F1 与基线逐样本一致（正确性恢复），TPOT 149.9→121.9 ms（**−18.7%**），recall_wait 48.65→0.0135 ms（host 不再被 DMA 阻塞）。**20 样本 A/B 复测中（预期 F1 ≈40.28 锚点、TPOT 收益同量级）。**
+
+**修复（`fix_double_buffer_slot.py`，v2 最终版）**：**取消全局 `_last_slot`/`_db_slot`，改 per-layer 槽位簿**：
+- P1：`self._db_cursor = {}`（决定"下次 recall 用哪个槽"）+ `self._db_used_slot = {}`（记录"本次 recall 用了哪个槽"）；
+- P2：recall 里 `_cursor = self._db_cursor.get(layer_idx, 0); _p = _cursor % 2; self._db_cursor[layer_idx] = _cursor + 1; self._db_used_slot[layer_idx] = _p`；
+- P6：删掉 `_last_slot = _p; _db_slot ^= 1`；
+- P8：scatter 里 `_p = self._db_used_slot.get(layer_idx, 0)`。
+**cursor 与 used_slot 解耦**是关键：cursor 只推进"下次"，used_slot 只记录"本次"，scatter 永远读 used_slot——不存在 v1 的错位。本地语义模拟（含跨 token 复用跳过 recall）验证每个 scatter 消费的槽位与同层本次 recall 完全一致。
+
+**⚠️ v1 修复的错误（已弃，勿重走）**：v1 在 P2 里"先读 `_db_used_slot.get(layer_idx,0)` 再 `+1` 存回"，导致 scatter 读到的总是**下一次** recall 的槽位 → tok 0 起全错 → KV 写坏 → 模型不吐 EOS、GPU 0%、CPU 2800%、跑 6 分钟无输出（与 §5 的"删 sync"症状相同）。修复必须**分离 cursor（推进）与 used_slot（记录）**，不能用一个变量既推进又记录。
+
+**配套工具**（已随仓库提交）：`apply_double_buffer_patch.py`（DB 补丁源）、`fix_double_buffer_slot.py`（fix2）、`add_dump_scatter.py`（scatter 侧差分 dump，env 门控 `ICECACHE_DUMP_TRANSIT`/`ICECACHE_DUMP_PATH`）、`roundtrip_latency.py`（微基准）。
 
