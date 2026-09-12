@@ -685,6 +685,37 @@ class InferState:
         else:
             self.cuda_cast_buffer = self.cuda_transit_buffer
 
+        # [ICECACHE-DOUBLEBUF] ping-pong transit buffers; order with events
+        # instead of c2g_stream.synchronize().  See apply_double_buffer_patch.py.
+        self.double_buffer = bool(int(os.environ.get("ICECACHE_DOUBLE_BUFFER", "0")))
+        self._db_cursor = {}
+        self._db_used_slot = {}
+        self._db_ev_read = [None, None]
+        self._db_ev_cast = [None, None]
+        self._db_ev_used = [None, None]
+        if self.double_buffer:
+            if self.batch_layer_recall or self.n_prefetch_layers:
+                raise ValueError(
+                    "ICECACHE_DOUBLE_BUFFER=1 is incompatible with batched "
+                    "layer recall and with layer prefetch")
+            _cast_alias = (self.cuda_cast_buffer is self.cuda_transit_buffer)
+            if self.n_reuse_layers > 0:
+                _w = 2 * self.n_kv_heads * (self.layer2budget[-1] - self.n_sink_pages - self.n_win_pages) * self.n_reuse_layers
+            else:
+                _w = 2 * self.n_kv_heads * (self.layer2budget[-1] - self.n_sink_pages - self.n_win_pages)
+            self.cpu_transit_buffer = [
+                torch.empty([self.batch_size, _w, self.page_size * self.head_dim],
+                            **self._recall_fp, pin_memory=True) for _ in range(2)]
+            self.cuda_transit_buffer = [
+                torch.empty([self.batch_size, _w, self.page_size * self.head_dim],
+                            **self._fp, pin_memory=False) for _ in range(2)]
+            if _cast_alias:
+                self.cuda_cast_buffer = self.cuda_transit_buffer
+            else:
+                self.cuda_cast_buffer = [
+                    self.cuda_cast_buffer,
+                    torch.empty_like(self.cuda_cast_buffer)]
+
         self.n_kv_pages = (q_len + self.page_size - 1) // self.page_size
         self.kv_last_page_len = (q_len - 1) % self.page_size + 1
         self.kv_last_page_lens = torch.tensor(
@@ -1609,6 +1640,24 @@ class InferState:
         profile_stage = self._profile_is_measured_step()
         gather_start = perf_counter() if profile_stage else None
 
+        # [ICECACHE-DOUBLEBUF] bind this recall to a buffer slot
+        if self.double_buffer:
+            _cursor = self._db_cursor.get(layer_idx, 0)
+            _p = _cursor % 2
+            self._db_cursor[layer_idx] = _cursor + 1
+            self._db_used_slot[layer_idx] = _p
+            _ptb = self.cpu_transit_buffer[_p]
+            _ctb = self.cuda_transit_buffer[_p]
+            _cbuf = self.cuda_cast_buffer[_p]
+            _evr = self._db_ev_read[_p]
+            if _evr is not None:
+                _evr.synchronize()
+        else:
+            _p = 0
+            _ptb = self.cpu_transit_buffer
+            _ctb = self.cuda_transit_buffer
+            _cbuf = self.cuda_cast_buffer
+
         n_transit_pages = torch.sum(nr).item()
 
         if self.fast_addr:
@@ -1643,7 +1692,7 @@ class InferState:
 
         with torch.cuda.stream(c2g_stream):
 
-            DCI.copy_to_buffer(self._src_address_buffer, ptr_dest=cast(self.cpu_transit_buffer[b].data_ptr(), c_void_p).value,
+            DCI.copy_to_buffer(self._src_address_buffer, ptr_dest=cast(_ptb[b].data_ptr(), c_void_p).value,
                                list_size=counter, update_num=self.page_size,
                                offset_s=self.n_kv_heads*self.page_size*self.head_dim,
                                offset_t=n_transit_pages*self.page_size*self.head_dim,
@@ -1661,8 +1710,11 @@ class InferState:
         ############################################################
 
         with torch.cuda.stream(c2g_stream):
-            dst = self.cuda_transit_buffer[:, : 2 * n_transit_pages, :]
-            src = self.cpu_transit_buffer[:, : 2 * n_transit_pages, :]
+            # [ICECACHE-DOUBLEBUF] slot reuse must wait for the consumer
+            if self.double_buffer and self._db_ev_used[_p] is not None:
+                c2g_stream.wait_event(self._db_ev_used[_p])
+            dst = _ctb[:, : 2 * n_transit_pages, :]
+            src = _ptb[:, : 2 * n_transit_pages, :]
             # [ICECACHE-DIAG] CUDA-event brackets for H2D and cast segments
             diag_on = self.diag_enabled and self.diag_event_budget > 0
             diag_e0 = torch.cuda.Event(enable_timing=True) if diag_on else None
@@ -1673,8 +1725,12 @@ class InferState:
             dst.copy_(src, non_blocking=True)
             if diag_e1 is not None:
                 diag_e1.record(c2g_stream)
+            if self.double_buffer:
+                if self._db_ev_read[_p] is None:
+                    self._db_ev_read[_p] = torch.cuda.Event()
+                self._db_ev_read[_p].record(c2g_stream)
 
-            self.cuda_cast_buffer[:, : 2 * n_transit_pages, :].copy_(
+            _cbuf[:, : 2 * n_transit_pages, :].copy_(
                 dst, non_blocking=True
             )
             if diag_e2 is not None:
@@ -1682,6 +1738,10 @@ class InferState:
             if diag_e0 is not None:
                 self.diag_pending.append((diag_e0, diag_e1, diag_e2))
                 self.diag_event_budget -= 1
+            if self.double_buffer:
+                if self._db_ev_cast[_p] is None:
+                    self._db_ev_cast[_p] = torch.cuda.Event()
+                self._db_ev_cast[_p].record(c2g_stream)
 
     def recall_layer_group(self, layer_idx: int, b: int,
                            rids: Tensor, nr: Tensor):
@@ -1856,7 +1916,10 @@ class InferState:
                     perf_counter() if self._profile_is_measured_step()
                     else None
                 )
-                c2g_stream.synchronize()
+                # [ICECACHE-DOUBLEBUF] with two slots the consumer stream
+                # waits on an event, so the host does not block here
+                if not self.double_buffer:
+                    c2g_stream.synchronize()
                 if recall_wait_start is not None:
                     self.profile_recall_wait_seconds += (
                         perf_counter() - recall_wait_start)
@@ -1872,6 +1935,19 @@ class InferState:
         return eids, nr
 
     def scatter_pages(self, layer_idx, eids, nr):
+        if self.double_buffer:
+            # [ICECACHE-DOUBLEBUF] consume this layer's used slot
+            _p = self._db_used_slot.get(layer_idx, 0)
+            _cur = torch.cuda.current_stream()
+            if self._db_ev_cast[_p] is not None:
+                _cur.wait_event(self._db_ev_cast[_p])
+            _cpp.scatter_pages(self.cuda_cast_buffer[_p],
+                               self.kv_caches[layer_idx].pool.buffer,
+                               eids, nr)
+            if self._db_ev_used[_p] is None:
+                self._db_ev_used[_p] = torch.cuda.Event()
+            self._db_ev_used[_p].record(_cur)
+            return
         transit = self.cuda_cast_buffer
         if self.batch_layer_recall and layer_idx in self._batched_recall_slices:
             start, width = self._batched_recall_slices[layer_idx]
