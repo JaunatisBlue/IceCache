@@ -1,1 +1,6 @@
 IceCache/source/icecache_cpp.*
+experiment/
+__pycache__/
+IceCache/benchmark/passkey.jsonl
+IceCache/benchmark/pred/
+*.bak_*
