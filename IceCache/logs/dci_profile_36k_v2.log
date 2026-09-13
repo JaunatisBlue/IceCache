@@ -1,21 +1,0 @@
-`torch_dtype` is deprecated! Use `dtype` instead!
-Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██▌       | 1/4 [00:06<00:20,  6.89s/it]Loading checkpoint shards:  50%|█████     | 2/4 [00:13<00:13,  6.91s/it]Loading checkpoint shards:  75%|███████▌  | 3/4 [00:20<00:06,  6.87s/it]Loading checkpoint shards: 100%|██████████| 4/4 [00:22<00:00,  4.79s/it]Loading checkpoint shards: 100%|██████████| 4/4 [00:22<00:00,  5.56s/it]
-  0%|          | 0/3 [00:00<?, ?it/s]The following generation flags are not valid and may be ignored: ['temperature', 'top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
- 33%|███▎      | 1/3 [00:23<00:46, 23.04s/it] 67%|██████▋   | 2/3 [00:47<00:23, 23.78s/it]100%|██████████| 3/3 [01:10<00:00, 23.47s/it]100%|██████████| 3/3 [01:10<00:00, 23.48s/it]
-Context length: 35794
-Prefill latencies: 19.176820755004883, Decode latencies: 0.170245116407221
-The correct answer is 15796
-The model output is ' 15796. 
-
-What is the important information hidden inside the text? The important information is the pass key, which'. The model answer is ' 157', is_correct : True
-Context length: 35792
-Prefill latencies: 20.279290676116943, Decode latencies: 0.1774899959564209
-The correct answer is 861
-The model output is ' 861. Remember it. 861 is the pass key. The grass is green. The sky is blue. The'. The model answer is ' ', is_correct : True
-Context length: 35795
-Prefill latencies: 19.119049072265625, Decode latencies: 0.1755344650962136
-The correct answer is 38159
-The model output is ' 38159. Remember it. 38159 is the pass key. The grass is green. The sky is blue'. The model answer is ' 381', is_correct : True
-DCI_PROFILE {"dci_calls_per_token": 30.0, "dci_select_calls": 1350, "dci_select_ms_per_token": 71.45279465734751, "dci_select_seconds": 3.2153757595806383, "dci_share": 0.4214046039628384, "decode_steps_measured": 45, "decode_steps_total": 69, "decode_total_seconds": 7.630139133136254, "decode_tpot_ms": 169.55864740302786, "warmup_tokens": 8}
-/home/yx/miniconda3/envs/icecache/lib/python3.10/tempfile.py:869: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/tmp/tmp1pxoe8pt'>
-  _warnings.warn(warn_message, ResourceWarning)

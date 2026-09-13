@@ -5,4 +5,8 @@ IceCache/benchmark/passkey.jsonl
 # Experiment outputs are regenerated per run; never commit them.
 IceCache/benchmark/pred/
 
+# Profile / log artefacts (not source)
+IceCache/logs/
+IceCache/passkey.jsonl
+
 *.bak_*
