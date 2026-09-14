@@ -21,7 +21,7 @@ from transformers.models.llama.modeling_llama import (
     repeat_kv,
 )
 
-from icecache.infer_state import InferState
+from icecache.infer_state import InferState, ForwardMode
 from icecache import kernels
 from time import time
 import numpy as np
@@ -281,9 +281,13 @@ def _icecache_decode(
             raise NotImplemented("kv cache is expected in the receive state")
     else:
         if budget is not None and kvc.n_pages > budget:
-            eids, nr = state.estimate_select_recall(cur_id, query_states)
-            
-            state.scatter_pages(cur_id, eids, nr)
+            eids, nr = state.retrieve_blocks(cur_id)
+            # scatter_pages walks the full eids width regardless of nr, so a
+            # no-change retrieval (nr == 0) must skip it -- otherwise it would
+            # re-scatter stale cast-buffer content into the slots.
+            if int(nr.sum()) > 0:
+                state.scatter_pages(cur_id, eids, nr)
+        # full-cache (n_pages <= budget): everything is resident, nothing to fetch
 
     if do_send_pf:
         query_states1 = (
@@ -338,6 +342,138 @@ def _icecache_decode(
     return attn_output, attn_weights
 
 
+def _icecache_continuation(
+    self: LlamaAttention,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] = None,
+    past_key_value: Optional[Cache] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    infer_state: InferState = None,
+    debug: bool = False,
+    **kwargs,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    """Multi-token continuation chunk over an existing, fully resident KV.
+
+    Phase B1: full-cache only.  The chunk is a plain causal paged prefill over
+    the whole contiguous KV, so there is no DCI work, no offload and no
+    split-attention merge here.  Absolute RoPE positions come from the caller's
+    ``position_ids``; this function never resets sequence state.
+    """
+    bsz, q_len, _ = hidden_states.size()
+    cur_id: int = self.layer_idx
+    state = infer_state
+    n_layers = state.n_layers
+
+    if cur_id == 0:
+        if state.use_dci:
+            state._prepare_continuation_sparse(bsz, q_len)
+        else:
+            state._prepare_continuation(bsz, q_len)
+
+    if hasattr(self.config, 'pretraining_tp') and self.config.pretraining_tp > 1:
+        key_value_slicing = (
+            self.config.num_key_value_heads * self.head_dim
+        ) // self.config.pretraining_tp
+        query_slices = self.q_proj.weight.split(
+            (self.config.num_attention_heads * self.head_dim) // self.config.pretraining_tp, dim=0
+        )
+        key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
+        value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+
+        query_states = torch.cat(
+            [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)],
+            dim=-1,
+        )
+        key_states = torch.cat(
+            [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)],
+            dim=-1,
+        )
+        value_states = torch.cat(
+            [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)],
+            dim=-1,
+        )
+    else:
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+    if "qwen3" in self.config._name_or_path.lower():
+        query_states = self.q_norm(query_states.view(bsz, q_len, self.config.num_attention_heads, self.head_dim)).transpose(1, 2)
+        key_states = self.k_norm(key_states.view(bsz, q_len, self.config.num_key_value_heads, self.head_dim)).transpose(1, 2)
+    else:
+        query_states = query_states.view(bsz, q_len, self.config.num_attention_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+    value_states = value_states.view(
+        bsz, q_len, self.config.num_key_value_heads, self.head_dim
+    )
+
+    kvc = state.kv_caches[cur_id]
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states = query_states.transpose(1, 2).contiguous()
+    key_states = key_states.transpose(1, 2).contiguous()
+
+    # Same order as prefill: the chunk's K/V is written first so that the paged
+    # prefill below sees it as the tail of the KV it attends over.
+    if state.use_dci:
+        # Sparse: refresh the resident semantic pages with BLOCK retrieval
+        # (policy b -- recency over the CPU page log).  The selection is
+        # query-independent, so the chunk and every decode step share the same
+        # resident set.  Then pack the resident per KV head and run one causal
+        # prefill with the KV head in the batch dimension.  The chunk's K/V is
+        # written into the paged cache after all layers.
+        eids, nr = state.retrieve_blocks(cur_id)
+        if int(nr.sum()) > 0:
+            state.scatter_pages(cur_id, eids, nr)
+
+        stage, indices, indptr, last_len = state._pack_resident(cur_id, q_len)
+        state._cont_pack[cur_id] = (stage, indices, indptr, last_len)
+        counts = state._resident_valid_counts(cur_id)
+        per_head = counts.sum(0)
+        ps = state.page_size
+        totals = per_head + q_len
+        pages = (totals + ps - 1) // ps
+        state._cont_per_head[cur_id] = per_head
+        state._cont_run_start[cur_id] = torch.cumsum(pages * ps, 0) - pages * ps
+
+        state._write_chunk_into_stage(cur_id, key_states, value_states)
+        attn_output = state.continuation_sdpa_batched(
+            cur_id, query_states, stage, indices, indptr, last_len
+        )
+        state._cont_kv[cur_id] = (key_states, value_states)
+    else:
+        state.append_paged_kv_cache(cur_id, key_states, value_states)
+        attn_output = state.prefill_sdpa(cur_id, query_states)
+    attn_output = attn_output.reshape(bsz, q_len, -1)
+
+    if 'llama' in self.config._name_or_path and self.config.pretraining_tp > 1:
+        attn_output = attn_output.split(
+            (self.config.head_dim * self.config.num_attention_heads) // self.config.pretraining_tp, dim=2
+        )
+        o_proj_slices = self.o_proj.weight.split(
+            (self.config.head_dim * self.config.num_attention_heads) // self.config.pretraining_tp, dim=1
+        )
+        attn_output = sum(
+            [F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)]
+        )
+    else:
+        attn_output = self.o_proj(attn_output)
+
+    attn_weights = None
+
+    if cur_id == n_layers - 1:
+        if state.use_dci:
+            state._finish_continuation_sparse(bsz, q_len)
+        else:
+            state._finish_continuation(bsz, q_len)
+
+    return attn_output, attn_weights
+
+
 def _icecache_attn_forward(
     self: LlamaAttention,
     hidden_states: torch.Tensor,
@@ -351,33 +487,52 @@ def _icecache_attn_forward(
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     _, q_len, _ = hidden_states.size()
+    mode = getattr(infer_state, "forward_mode", None)
 
+    if mode is ForwardMode.CONTINUATION_PREFILL:
+        # Never inferred from q_len: a continuation chunk and a fresh prompt are
+        # the same shape, so the caller has to declare which one this is.
+        if q_len <= 1:
+            raise ValueError(
+                f"forward_mode=CONTINUATION_PREFILL requires q_len > 1, got {q_len}; "
+                "use ForwardMode.DECODE for single tokens"
+            )
+        return _icecache_continuation(
+            self, hidden_states, attention_mask, position_embeddings,
+            past_key_value, output_attentions, use_cache, infer_state, debug, **kwargs,
+        )
+    if mode is ForwardMode.INITIAL_PREFILL:
+        if q_len <= 1:
+            raise ValueError(
+                f"forward_mode=INITIAL_PREFILL requires q_len > 1, got {q_len}"
+            )
+        return _icecache_prefill(
+            self, hidden_states, attention_mask, position_embeddings,
+            past_key_value, output_attentions, use_cache, infer_state, debug, **kwargs,
+        )
+    if mode is ForwardMode.DECODE:
+        if q_len != 1:
+            raise ValueError(
+                f"forward_mode=DECODE requires q_len == 1, got {q_len}; "
+                "use ForwardMode.CONTINUATION_PREFILL for a multi-token chunk"
+            )
+        return _icecache_decode(
+            self, hidden_states, attention_mask, position_embeddings,
+            past_key_value, output_attentions, use_cache, infer_state, debug, **kwargs,
+        )
+
+    # forward_mode is None: legacy q_len dispatch.  Retained for HF generate(),
+    # the benchmark scripts and the phase A oracle; the session classes always
+    # set an explicit mode.
     if q_len > 1:
         return _icecache_prefill(
-            self,
-            hidden_states,
-            attention_mask,
-            position_embeddings,
-            past_key_value,
-            output_attentions,
-            use_cache,
-            infer_state,
-            debug,
-            **kwargs,
+            self, hidden_states, attention_mask, position_embeddings,
+            past_key_value, output_attentions, use_cache, infer_state, debug, **kwargs,
         )
-    else:
-        return _icecache_decode(
-            self,
-            hidden_states,
-            attention_mask,
-            position_embeddings,
-            past_key_value,
-            output_attentions,
-            use_cache,
-            infer_state,
-            debug,
-            **kwargs,
-        )
+    return _icecache_decode(
+        self, hidden_states, attention_mask, position_embeddings,
+        past_key_value, output_attentions, use_cache, infer_state, debug, **kwargs,
+    )
 
 
 def enable_icecache(
@@ -415,5 +570,10 @@ def enable_icecache(
                     mod, *args, infer_state=infer_state, debug=debug, **kwargs
                 )
             )(mod)
-    
+
+    # Expose the state so a caller (e.g. an agent session driving continuation)
+    # can read seq_len / dci_db without going through the attention closure.
+    # Purely additive: attention patching behaviour is unchanged.
+    self._icecache_infer_state = infer_state
+
     return self

@@ -219,6 +219,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        return_lse: bool = False,
     ):
         check_pos_encoding_mode(pos_encoding_mode)
         if sm_scale is None:
@@ -229,7 +230,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_theta = 1e4
         assert not is_float8(q)
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
-        return self._wrapper.forward(
+        ret = self._wrapper.forward(
             q.reshape(-1, *q.shape[-2:]),
             self._qo_indptr,
             paged_kv_data,
@@ -243,8 +244,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             sm_scale,
             rope_scale,
             rope_theta,
-            False,
-        )[0]
+            return_lse,
+        )
+        # The C++ op already returns {o} or {o, lse}; lse has shape
+        # [nnz_qo, num_qo_heads] in fp32.
+        if return_lse:
+            return ret[0], ret[1]
+        return ret[0]
 
 
 class BatchDecodeWithPagedKVCacheWrapper:
@@ -316,6 +322,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         page_valid_entries: Optional[torch.Tensor] = None,
         dci: Optional[bool] = False,
+        return_lse: bool = False,
     ):
         check_pos_encoding_mode(pos_encoding_mode)
         if sm_scale is None:
@@ -329,7 +336,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             dci = False
             page_valid_entries = torch.empty(0)
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
-        return self._wrapper.forward(
+        ret = self._wrapper.forward(
             q.reshape(-1, *q.shape[-2:]),
             paged_kv_data,
             self._paged_kv_indptr,
@@ -340,7 +347,96 @@ class BatchDecodeWithPagedKVCacheWrapper:
             sm_scale,
             rope_scale,
             rope_theta,
-            False,
+            return_lse,
             page_valid_entries,
             dci,
-        )[0]
+        )
+        # lse is [batch_size, num_qo_heads] in fp32 when requested.
+        if return_lse:
+            return ret[0], ret[1]
+        return ret[0]
+
+
+# ---------------------------------------------------------------------------
+# Split attention bookkeeping
+#
+# The two-pass continuation scheme (non-causal over the old context, causal
+# over the new chunk) produces two partial results that must be combined by
+# their log-sum-exp.  Upstream FlashInfer ships ``merge_state`` for this, but
+# the vendored copy under ``3rdparty/flashinfer`` does NOT contain it -- only
+# decode.cuh has been touched, to add ``page_valid_entries``.  So the merge is
+# implemented here.
+#
+# IMPORTANT -- lse base.  The lse produced by these wrappers is in the **base-2**
+# (log2) domain, matching FlashInfer's internal softmax.  Measured on this build:
+# lse_kernel / lse_natural == log2(e) == 1.4427 (to fp32 precision), while the
+# attention output itself matches a natural-log reference to ~2e-4.  The merge
+# below is therefore written with exp2/log2 and returns lse in the same base-2
+# domain as its inputs.  See docs/phase_b_continuation_prefill_design.md.
+# ---------------------------------------------------------------------------
+
+LOG2E = 1.4426950408889634
+
+
+def lse_log2_to_natural(lse: torch.Tensor) -> torch.Tensor:
+    """Convert a base-2 lse (as returned by the wrappers) to natural log."""
+    return lse / LOG2E
+
+
+def lse_natural_to_log2(lse: torch.Tensor) -> torch.Tensor:
+    """Convert a natural-log lse to the base-2 domain used by the wrappers."""
+    return lse * LOG2E
+
+
+def _lse_as_nh(lse: torch.Tensor, num_heads: int) -> torch.Tensor:
+    """Normalise an lse tensor to ``[N, num_heads]`` fp32."""
+    if lse.ndim != 2:
+        raise ValueError(f"lse must be 2-D, got shape {tuple(lse.shape)}")
+    lse = lse.float()
+    if lse.shape[-1] == num_heads:
+        return lse
+    if lse.shape[0] == num_heads:
+        return lse.transpose(0, 1).contiguous()
+    raise ValueError(
+        f"lse shape {tuple(lse.shape)} matches neither [N, {num_heads}] nor [{num_heads}, N]"
+    )
+
+
+def merge_state(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+):
+    """Equivalent of FlashInfer's ``merge_state`` for two disjoint partial results.
+
+    ``out_*`` is ``[N, num_heads, head_dim]``; ``lse_*`` is ``[N, num_heads]``
+    (or its transpose) in the **base-2** domain.  Returns ``(out, lse)`` with
+    ``out`` in the dtype of ``out_a`` and ``lse`` still base-2.
+
+    Formula (base-2)::
+
+        m   = max(lse_a, lse_b)
+        out = (out_a * 2**(lse_a - m) + out_b * 2**(lse_b - m))
+              / (2**(lse_a - m) + 2**(lse_b - m))
+        lse = m + log2(2**(lse_a - m) + 2**(lse_b - m))
+    """
+    if out_a.shape != out_b.shape:
+        raise ValueError(f"out shapes differ: {tuple(out_a.shape)} vs {tuple(out_b.shape)}")
+    num_heads = out_a.shape[-2]
+    la = _lse_as_nh(lse_a, num_heads).unsqueeze(-1)
+    lb = _lse_as_nh(lse_b, num_heads).unsqueeze(-1)
+
+    m = torch.maximum(la, lb)
+    wa = torch.exp2(la - m)
+    wb = torch.exp2(lb - m)
+    denom = wa + wb
+    safe = denom.clamp_min(torch.finfo(denom.dtype).tiny)
+    out = (out_a.float() * wa + out_b.float() * wb) / safe
+    lse = (m + torch.log2(safe)).squeeze(-1)
+    return out.to(out_a.dtype), lse
+
+
+def merge_state_single(out_a, lse_a, out_b, lse_b):
+    """Convenience wrapper returning only the merged output."""
+    return merge_state(out_a, lse_a, out_b, lse_b)[0]

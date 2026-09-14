@@ -29,5 +29,6 @@
 // EOL
 
 #define _DISPATCH_CASES_causal(case_var, ...)         \
+  _DISPATCH_CASE(false, case_var, __VA_ARGS__) \
   _DISPATCH_CASE(true, case_var, __VA_ARGS__) \
 // EOL

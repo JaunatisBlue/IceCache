@@ -1,6 +1,7 @@
 from typing import List, Union, Dict, Tuple
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
 import asyncio
 from threading import Thread
 import threading
@@ -26,6 +27,22 @@ class DeprecatedError(NotImplementedError):
 
 
 Digest = Tuple[Tensor, Tensor]
+
+
+class ForwardMode(Enum):
+    """Explicit attention mode for a forward pass.
+
+    Set by the caller (a session) immediately before invoking the model and
+    cleared afterwards.  ``None`` means "legacy": dispatch on ``q_len``, which is
+    what ``generate()`` and the benchmark scripts rely on, and what phase A's
+    oracle uses.  ``CONTINUATION_PREFILL`` is never inferred from ``q_len`` --
+    it must be declared, because a multi-token continuation chunk is otherwise
+    indistinguishable from a fresh prompt.
+    """
+
+    INITIAL_PREFILL = "initial_prefill"
+    CONTINUATION_PREFILL = "continuation_prefill"
+    DECODE = "decode"
 
 
 class InferState:
@@ -228,6 +245,9 @@ class InferState:
         # self._future_dci_results = [None] * 3
         self._dci_future = None
 
+        # Explicit forward mode; None => legacy q_len dispatch.  See ForwardMode.
+        self.forward_mode = None
+
         if n_prefetch_layers > 0:
             self.n_reused_layers = self.n_prefetch_layers - 1
             if self.n_prefetch_layers > 1:
@@ -282,6 +302,12 @@ class InferState:
         self.prefill_backup_events = [None] * self.n_layers
         self.prefill_evicted_pages = [None] * self.n_layers
         self.selected_page_idx = [None] * self.n_layers
+        # ordered CPU page log (policy b): page j = the j-th offloaded page in
+        # token order.  Fed at both ingestion points (prompt offload in
+        # _DCI_first_call, chunk evictions in _prepare_continuation_sparse);
+        # block retrieval reads THIS, not the tree's per-head leaf space.
+        self._page_log = [[] for _ in range(self.n_layers)]
+        self._block_sel = {}
         self.kv_caches = [None] * self.n_layers
         self.cpu_kv_caches = [None] * self.n_layers
         self.temp_cpu_kv_caches = [None] * self.n_layers
@@ -463,6 +489,341 @@ class InferState:
             with torch.cuda.stream(self.decode_backup_stream):
                 [self.decode_backup_win_page(l) for l in range(self.n_layers)]
 
+    # ------------------------------------------------------------------
+    # Phase B1: multi-token continuation over an existing, fully resident KV.
+    #
+    # Scope is deliberately narrow: no DCI retrieval, no page eviction, no
+    # window rotation.  It must not call _prepare_prefill()/_finish_prefill(),
+    # must not clear any pool, and must not touch the DCI objects.
+    # ------------------------------------------------------------------
+
+    def _prepare_continuation(self, bsz, q_len):
+        """Allocate pages for a continuation chunk and arm the paged prefill.
+
+        The chunk's attention is a plain causal paged prefill over the whole
+        (contiguous, fully GPU-resident) KV, so no split-attention merge is
+        needed -- see ``kernels.merge_state`` for why that is *not* true once
+        DCI-retained semantic pages enter the picture.
+        """
+        if q_len <= 1:
+            raise ValueError(f"continuation requires q_len > 1, got {q_len}")
+        if self.use_dci:
+            raise NotImplementedError(
+                "continuation over the sparse DCI path is not implemented. This build "
+                "supports continuation only when nothing was offloaded (use_dci == False), "
+                "i.e. the whole sequence fits the GPU page budget. Chunked DCI retrieval is "
+                "phase C; see docs/phase_b_continuation_prefill_design.md."
+            )
+        if self.kv_caches[0] is None:
+            raise RuntimeError("continuation requires a completed initial prefill")
+
+        # Full-cache contract: the whole sequence must stay resident.  A chunk
+        # that would exceed the page budget must fail loudly -- the allocation
+        # below would otherwise silently rotate the window (the decode path's
+        # eviction branch) and destroy pages with no tree insertion
+        # (review finding: "追加后超过 page budget 时仍可能静默轮转").
+        kvc0 = self.kv_caches[0]
+        if kvc0.budget is not None:
+            projected_tokens = int(kvc0.seq_len) + q_len
+            projected_pages = (
+                projected_tokens + self.page_size - 1) // self.page_size
+            if projected_pages > kvc0.budget:
+                raise ValueError(
+                    "full-cache continuation would exceed the page budget: "
+                    f"{projected_tokens} tokens -> {projected_pages} pages > "
+                    f"budget {kvc0.budget}. Enlarge page_budgets or ingest the "
+                    "tool result in smaller chunks."
+                )
+
+        # Append the chunk's pages to every layer.  With no offload there is no
+        # eviction, so this is a pure append; `alloc_page` still handles pool
+        # bookkeeping.
+        for kvc in self.kv_caches:
+            kvc.decode_alloc_n_tokens(q_len, self.alloc_page)
+
+        self.n_kv_pages = utils.all_eq(kvc.n_real_pages for kvc in self.kv_caches)
+        self.kv_last_page_len = utils.all_eq(kvc.last_page_len for kvc in self.kv_caches)
+        self.kv_last_page_lens = torch.tensor([self.kv_last_page_len] * bsz, **self._i32)
+
+        kv_indptr = torch.arange(0, bsz * self.n_kv_pages + 1, self.n_kv_pages, **self._i32)
+        for b in self.budget2layers:
+            self.kv_indptrs_tab[b] = self.kv_decode_indptrs_tab[b] = kv_indptr
+
+        qo_indptr = torch.arange(0, bsz * q_len + 1, q_len, **self._i32)
+        self.prefill_handler.begin_forward(
+            qo_indptr,
+            kv_indptr,
+            self.kv_last_page_lens,
+            self.n_qo_heads,
+            self.n_kv_heads,
+            self.head_dim,
+        )
+
+    def _finish_continuation(self, bsz, q_len):
+        for b, ls in self.budget2layers.items():
+            n_kv_pages = utils.all_eq(
+                self.kv_caches[l].n_real_pages for l in ls)
+            self.kv_indptrs_tab[b] = self.kv_decode_indptrs_tab[b] = torch.arange(
+                0, bsz * n_kv_pages + 1, n_kv_pages, **self._i32
+            )
+        self.prefill_handler.end_forward()
+
+    # ------------------------------------------------------------------
+    # Sparse continuation (DCI active): a whole chunk is ingested in one
+    # forward instead of one token at a time.
+    #
+    # The resident KV is gathered into per-KV-head contiguous runs (see the
+    # B0b note on page_valid_entries being [page, kv_head]) and the chunk is
+    # appended after each head's resident run.  All resident tokens precede
+    # every chunk token, so a *plain causal* mask over the concatenation is the
+    # right attention -- no split, no LSE merge (design doc section 5.6).
+    # ------------------------------------------------------------------
+
+    def _resident_valid_counts(self, layer_idx):
+        """[n_slots, n_kv_heads] valid entry count of the currently resident KV.
+
+        Mirrors exactly what the decode kernel sees: ``page_valid_entries`` is
+        indexed ``[page_idx, head]`` where ``page_idx`` runs over the resident
+        slots in ``paged_kv_indices`` order (i.e. ``c2p`` order), and the tail
+        slot's valid count is further clamped by ``kv_last_page_len``.
+        """
+        kvc = self.kv_caches[layer_idx]
+        n = kvc.n_real_pages
+        counts = self.page_valid_entries[layer_idx][:n].clone()   # [n, H]
+        if self.kv_last_page_len < self.page_size:
+            counts[n - 1] = torch.minimum(
+                counts[n - 1],
+                torch.full_like(counts[n - 1], self.kv_last_page_len),
+            )
+        return counts
+
+    def _pack_resident(self, layer_idx, chunk_len):
+        """Gather the resident KV into page-aligned per-KV-head runs.
+
+        Returns ``(stage, indices, indptr, last_len)`` where ``stage`` is HND
+        with ``num_kv_heads == 1`` and one *request* per KV head; each request's
+        resident tokens are packed contiguously (slot-major within a head) and
+        ``chunk_len`` empty slots are reserved after them.
+
+        The packing order must match the decode kernel's view: for head ``h``,
+        the resident tokens are ``slot 0..n-1`` each truncated to its per-head
+        valid count, in that order.
+        """
+        kvc = self.kv_caches[layer_idx]
+        H, ps, D = self.n_kv_heads, self.page_size, self.head_dim
+        counts = self._resident_valid_counts(layer_idx)      # [n, H]
+        n = kvc.n_real_pages
+        slots = kvc.c2p[0]                                   # [n] absolute page ids
+
+        per_head = counts.sum(0)                             # [H] resident token count
+        totals = per_head + chunk_len
+        pages = (totals + ps - 1) // ps
+        run_start = torch.cumsum(pages * ps, 0) - pages * ps
+        total_slots = int(run_start[-1].item() + pages[-1].item() * ps)
+        stage = torch.zeros(total_slots, 2, D, dtype=self.dtype, device=self.device)
+
+        # Pack head by head, slot by slot -- unambiguous, mirrors decode order.
+        for h in range(H):
+            run = run_start[h]
+            for s in range(n):
+                c = int(counts[s, h].item())
+                if c == 0:
+                    continue
+                # buffer is [n_phys, 2, H, ps, D]; slice -> [2, c, D]; transpose -> [c, 2, D]
+                src = kvc.buffer[slots[s], :, h, :c, :].transpose(0, 1).contiguous()
+                stage[run : run + c] = src
+                run += c
+
+        # Rewrap into the [n_pages, 2, 1, ps, D] layout the kernel expects.
+        n_pages = total_slots // ps
+        stage = stage.reshape(n_pages, ps, 2, D).permute(0, 2, 1, 3).contiguous()
+        stage = stage.unsqueeze(2)  # -> [n_pages, 2, 1, ps, D]
+
+        last_len = ((totals - (pages - 1) * ps).to(torch.int32))
+        indptr = torch.cat([
+            torch.zeros(1, dtype=torch.int32, device=self.device),
+            torch.cumsum(pages, 0).to(torch.int32).to(self.device),
+        ])
+        indices = torch.arange(n_pages, dtype=torch.int32, device=self.device)
+        return stage, indices, indptr, last_len
+
+    def _write_chunk_into_stage(self, layer_idx, keys, vals):
+        """Place this layer's chunk K/V right after each head's resident run.
+
+        ``stage`` is ``[n_pages, 2, 1, ps, D]`` (page-major).  A linear slot
+        index ``i`` maps to page ``i // ps``, offset ``i % ps``.  We write the
+        chunk into the slots right after each head's resident run, using the
+        (page, offset) decomposition directly so the write lands back in the
+        real ``stage`` buffer (a flatten+permute view would be a detached copy).
+        """
+        stage, indices, indptr, last_len = self._cont_pack[layer_idx]
+        H, D = self.n_kv_heads, self.head_dim
+        ps = self.page_size
+        C = keys.shape[1]
+        per_head = self._cont_per_head[layer_idx]      # [H] resident token count
+        run_start = self._cont_run_start[layer_idx]    # [H] page-aligned slot offset
+
+        for h in range(H):
+            start = int(run_start[h]) + int(per_head[h])
+            for i in range(C):
+                slot = start + i
+                page = slot // ps
+                off = slot % ps
+                stage[page, 0, 0, off, :] = keys[0, i, h, :]
+                stage[page, 1, 0, off, :] = vals[0, i, h, :]
+
+    def continuation_sdpa_batched(self, layer_idx, q, stage, indices, indptr, last_len):
+        """One paged prefill with the KV head in the batch dimension.
+
+        ``q`` is ``[bsz, q_len, n_qo_heads, head_dim]`` (bsz == 1), the same
+        shape ``prefill_sdpa`` consumes.  Each KV head keeps its own length,
+        which a single ``last_page_len`` cannot express.
+        """
+        H, ratio, D = self.n_kv_heads, self.ratio, self.head_dim
+        C = q.shape[1]
+        # q: [1, C, H*ratio, D]. q head index = kv*ratio + g.  Move the head dim
+        # to the front, split it into (kv, group), then reorder to kv-major batch.
+        qb = (
+            q[0].permute(1, 0, 2)                 # [H*ratio, C, D]
+            .reshape(H, ratio, C, D)              # [H, ratio, C, D]
+            .permute(0, 2, 1, 3)                  # [H, C, ratio, D]
+            .reshape(H * C, ratio, D)
+            .contiguous()
+        )
+        handler = self.prefill_handler
+        handler.begin_forward(
+            torch.arange(0, H * C + 1, C, dtype=torch.int32, device=self.device),
+            indptr,
+            last_len,
+            ratio,
+            1,
+            D,
+        )
+        out = handler.forward(qb, stage, indices, causal=True)
+        handler.end_forward()
+        # out: [H*C, ratio, D] -> [C, H*ratio, D] -> [1, C, H*ratio, D]
+        out = out.reshape(H, C, ratio, D).permute(1, 0, 2, 3).reshape(C, H * ratio, D)
+        return out.unsqueeze(0)
+
+    def _drain_pending_offload(self):
+        """Insert any backed-up window page into the existing DCI tree."""
+        self.default_stream.wait_stream(self.decode_backup_stream)
+        if self.offload_win_flag[-1]:
+            for l in range(self.n_layers):
+                self.offload_win_page_to_DCI(l)
+                self.offload_win_flag[l] = False
+
+    def _prepare_continuation_sparse(self, bsz, q_len):
+        """Allocate pages for a sparse continuation chunk, mirroring decode's
+        window lifecycle.
+
+        Deterministic CPU append ("page 追加到 cpu"): as the chunk's pages are
+        allocated, the window pages they displace are captured and appended to
+        the CPU store / DCI tree in **one bulk ``_DCI_add`` per layer**, in
+        eviction order -- instead of decode's per-token backup/drain dance.
+
+        Invariant kept: the tree and the window stay disjoint.  A page enters
+        the tree only when it is about to leave (or has left) the window, so a
+        later retrieval can never double-count tokens that are also resident.
+        This is why the chunk's own pages do NOT enter the tree here: they are
+        the new window content, and they flow to the CPU store when a later
+        chunk/decode displaces them -- by the same deterministic path.
+
+        The chunk's K/V is written by ``_finish_continuation_sparse`` AFTER all
+        layers, landing at the physical tail (``append_start = seq_len - q_len``
+        of the resident operand), which has room because the loop below
+        allocated the chunk's pages.
+        """
+        if q_len <= 1:
+            raise ValueError(f"continuation requires q_len > 1, got {q_len}")
+        if self.kv_caches[0] is None:
+            raise RuntimeError("continuation requires a completed initial prefill")
+        if bsz != 1:
+            raise NotImplementedError("sparse continuation supports batch_size == 1")
+
+        # resident packing is deferred to _icecache_continuation, per layer, AFTER
+        # the chunk-level DCI retrieval refreshes the semantic pages.
+        self._cont_pack = [None] * self.n_layers
+        self._cont_per_head = [None] * self.n_layers
+        self._cont_run_start = [None] * self.n_layers
+        self._cont_kv = [None] * self.n_layers
+
+        # drain any backup a previous decode step left behind
+        self._drain_pending_offload()
+
+        # Advance the window token by token (same rotation as decode) and capture
+        # the pages that leave it.  q_len is at most a few hundred and this is
+        # pure bookkeeping -- the attention stays chunk-level (one forward).
+        ps = self.page_size
+        evicted = [[] for _ in range(self.n_layers)]  # per layer: [2, H, ps, D]
+        for _ in range(q_len):
+            for l, kvc in enumerate(self.kv_caches):
+                if (kvc.budget is not None and kvc.n_real_pages >= kvc.budget
+                        and kvc.last_page_len == ps):
+                    # this token crosses a page boundary -> the allocation below
+                    # rotates the window and destroys the page at next_evict_idx
+                    evicted[l].append(
+                        kvc.buffer[kvc.c2p[0, kvc.next_evict_idx]].clone()
+                    )
+            for kvc in self.kv_caches:
+                kvc.decode_alloc_1_token(self.alloc_page)
+            self.kv_last_page_len = utils.all_eq(
+                kvc.last_page_len for kvc in self.kv_caches
+            )
+        self.kv_last_page_lens = torch.tensor([self.kv_last_page_len], **self._i32)
+        self.n_dci_pages = (self.kv_caches[-1].budget - self.n_sink_pages
+                            - self.kv_caches[-1].n_win_pages)
+
+        # bulk append: one _DCI_add per layer with every page that left the
+        # window, in eviction order (oldest first).  _DCI_add expects host
+        # tensors (decode feeds it from the CPU offload cache), so copy down.
+        # The same pages are appended to the ordered CPU page log (policy b's
+        # retrieval source).
+        H, D = self.n_kv_heads, self.head_dim
+        for l in range(self.n_layers):
+            if not evicted[l]:
+                continue
+            pages = torch.stack(evicted[l], dim=0).contiguous()  # [n, 2, H, ps, D]
+            kv = (
+                pages.permute(1, 0, 2, 3, 4).permute(0, 2, 1, 3, 4)
+                .reshape(2, H, -1, D).contiguous().cpu()
+            )
+            self._DCI_add(0, l, kv[0], kv[1])
+            self._page_log[l].extend([p.cpu() for p in evicted[l]])
+
+        # if the chunk ends with a full tail, the NEXT rotation needs the page at
+        # next_evict_idx preserved: defer it exactly the way decode does (backup
+        # now; the next step's drain inserts it into the tree before its own
+        # rotation destroys the slot)
+        if (self.kv_caches[-1].n_real_pages >= self.kv_caches[-1].budget
+                and self.kv_last_page_len == ps):
+            for l in range(self.n_layers):
+                self.offload_win_flag[l] = True
+            with torch.cuda.stream(self.decode_backup_stream):
+                [self.decode_backup_win_page(l) for l in range(self.n_layers)]
+
+        self.n_kv_pages = utils.all_eq(kvc.n_real_pages for kvc in self.kv_caches)
+        kv_indptr = torch.arange(0, self.n_kv_pages + 1, self.n_kv_pages, **self._i32)
+        for b in self.budget2layers:
+            self.kv_indptrs_tab[b] = self.kv_decode_indptrs_tab[b] = kv_indptr
+
+    def _finish_continuation_sparse(self, bsz, q_len):
+        # append_paged_kv_cache_prefill writes at the *tail* of the paged KV
+        # (page.cuh: append_start = seq_len - append_seq_len), so the chunk lands
+        # at positions [old_total, new_total) now that indptr/last_page_len
+        # describe the post-chunk state.
+        for l in range(self.n_layers):
+            keys, vals = self._cont_kv[l]
+            self.append_paged_kv_cache(l, keys, vals)
+        self._cont_kv = [None] * self.n_layers
+        self._cont_pack = [None] * self.n_layers
+        self._cont_per_head = [None] * self.n_layers
+        self._cont_run_start = [None] * self.n_layers
+        for b, ls in self.budget2layers.items():
+            n_kv_pages = utils.all_eq(self.kv_caches[l].n_real_pages for l in ls)
+            self.kv_indptrs_tab[b] = self.kv_decode_indptrs_tab[b] = torch.arange(
+                0, bsz * n_kv_pages + 1, n_kv_pages, **self._i32
+            )
 
     def _prepare_decode(self, bsz):
         if self.kv_last_page_len + 1 >= self.page_size:  # n_win_pages >= 2
@@ -867,6 +1228,103 @@ class InferState:
 
             return evicted_idx.contiguous(), recall_idx.contiguous(), evict_num
 
+    def select_pages(self, layer_idx):
+        """Block-granular selection over the ordered CPU page log (policy b:
+        recency).
+
+        ``_page_log[layer][j]`` holds the j-th offloaded page in token order
+        (appended at both ingestion points: prompt offload and chunk evictions).
+        Recency selection is therefore a slice of log indices -- no tree query,
+        no query vector.  The DCI tree's ``num_leaves`` are tree-internal nodes
+        that differ per head and are NOT page ids, so the selection bypasses
+        the leaf space entirely.
+
+        Because the selection is query-independent, every decode step and every
+        chunk token share the same resident set (the §6.1 chunk/tokenwise
+        divergence under DCI does not exist here).  A relevance-based block
+        policy can replace the slice later without touching anything else.
+        """
+        filled = len(self._page_log[layer_idx])
+        K = self.n_dci_pages - self.layer2topk[layer_idx]
+        k = min(K, filled)
+        return list(range(filled - k, filled))
+
+    def retrieve_blocks(self, layer_idx):
+        """Block retrieval (policy b): select + copy CPU pages -> semantic slots.
+
+        Replaces ``estimate_select_recall``: same return contract ``(eids, nr)``
+        for ``scatter_pages``, no query vector.  The selected pages are copied
+        CPU -> transit -> cast buffer with the same ``copy_to_buffer`` call
+        ``recall`` uses -- addresses rebuilt directly from the CPU cache
+        (``cpu_cache[b, j].data_ptr() + head * page_offset``), bypassing the
+        per-head DCI leaf addressing.
+        """
+        kvc = self.kv_caches[layer_idx]
+        ns = kvc.n_sink_pages
+        K = self.n_dci_pages - self.layer2topk[layer_idx]
+        page_ids = self.select_pages(layer_idx)
+        k = len(page_ids)
+
+        # skip the copy when the selection is unchanged (the common case between
+        # window slides); page_valid_entries is refreshed either way
+        prev = getattr(self, "_block_sel", None)
+        unchanged = prev is not None and prev.get(layer_idx) == page_ids
+        if not hasattr(self, "_block_sel"):
+            self._block_sel = {}
+        self._block_sel[layer_idx] = page_ids
+
+        self.page_valid_entries[layer_idx][ns: ns + k] = self.page_size
+        if k < K:
+            self.page_valid_entries[layer_idx][ns + k: ns + K] = 0
+
+        eids = kvc.c2p[0, ns: ns + k].unsqueeze(0).expand(
+            self.n_kv_heads, -1).contiguous()
+        if unchanged or k == 0:
+            # slots already hold this selection's content: nr=0 makes the
+            # caller's scatter_pages a no-op.  Returning the full nr here would
+            # make it re-scatter from a STALE cast buffer and corrupt the slots.
+            nr = torch.zeros((self.n_kv_heads,), dtype=torch.int64,
+                             device=self.device)
+            return eids, nr
+        nr = torch.full((self.n_kv_heads,), k, dtype=torch.int64,
+                        device=self.device)
+
+        thread_id = threading.get_ident()
+        if hasattr(self, '_thread_locals') and thread_id in self._thread_locals:
+            c2g_stream = self._thread_locals[thread_id].c2g_stream
+        else:
+            c2g_stream = self.c2g_stream
+
+        cpu_cache = self._page_log[layer_idx]
+        b = 0
+        head_page_offset = self.page_size * self.head_dim * self.cpu_dtype.itemsize
+        n_transit_pages = k * self.n_kv_heads
+        counter = 0
+        for i in range(self.n_kv_heads):
+            for j in page_ids:
+                self._src_address_buffer[counter] = (
+                    cpu_cache[j].data_ptr() + i * head_page_offset)
+                counter += 1
+
+        with torch.cuda.stream(c2g_stream):
+            DCI.copy_to_buffer(
+                self._src_address_buffer,
+                ptr_dest=cast(self.cpu_transit_buffer[b].data_ptr(),
+                              c_void_p).value,
+                list_size=counter, update_num=self.page_size,
+                offset_s=self.n_kv_heads * self.page_size * self.head_dim,
+                offset_t=n_transit_pages * self.page_size * self.head_dim,
+                dim=self.head_dim,
+                page_size=self.page_size * self.head_dim, dtype=0)
+            dst = self.cuda_transit_buffer[:, : 2 * n_transit_pages, :]
+            src = self.cpu_transit_buffer[:, : 2 * n_transit_pages, :]
+            dst.copy_(src, non_blocking=True)
+            self.cuda_cast_buffer[:, : 2 * n_transit_pages, :].copy_(
+                dst, non_blocking=True)
+        c2g_stream.synchronize()
+
+        return eids, nr
+
     def append_paged_kv_cache(self, layer_idx: int, keys: Tensor, vals: Tensor):
         kvc = self.kv_caches[layer_idx]
         kernels.append_paged_kv_cache(
@@ -1099,6 +1557,11 @@ class InferState:
                         # shape: [bsz, num_neighbours]
                         0, 1), offloaded_pages_cat[0], offloaded_pages_cat[1], projected)
                     
+                # ordered page log: the prompt's offloaded pages, in token order
+                # (must land in the log BEFORE tmp_cpu_kvc.clear() frees them)
+                self._page_log[layer_idx].extend(
+                    tmp_cpu_kvc[b, : self.num_offload_pages].clone())
+
                 tmp_cpu_kvc.clear()
             else:
                 self.use_dci = False
