@@ -4,3 +4,4 @@ __pycache__/
 IceCache/benchmark/passkey.jsonl
 IceCache/benchmark/pred/
 *.bak_*
+code_ref/
