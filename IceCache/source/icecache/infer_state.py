@@ -278,6 +278,35 @@ class InferState:
         self.profile_recall_wait_seconds = 0.0
         self.profile_page_metadata_seconds = 0.0
         self.profile_index_update_seconds = 0.0
+        # Fine-grained decode-side incremental DCI insertion timers.  These
+        # are opt-in with profile_dci and split the coarse index_update timer.
+        self.profile_index_pack_seconds = 0.0
+        self.profile_index_numpy_seconds = 0.0
+        self.profile_index_prepare_seconds = 0.0
+        self.profile_index_native_insert_seconds = 0.0
+        self.profile_index_ccc_writeback_seconds = 0.0
+        self.profile_index_page_alloc_seconds = 0.0
+        self.profile_index_address_update_seconds = 0.0
+        self.profile_index_address_prepare_seconds = 0.0
+        self.profile_index_native_address_update_seconds = 0.0
+        self.profile_index_reuse_update_seconds = 0.0
+        # Step-1 subdivision of index_address_prepare: metadata prep, the
+        # per-leaf data_ptr() resolution loop, the list->ndarray conversion and
+        # the page_address_buffer write.  Only touched when profile_dci=True.
+        self.profile_index_addrprep_meta_seconds = 0.0
+        self.profile_index_addrprep_leaf_seconds = 0.0
+        self.profile_index_addrprep_np_seconds = 0.0
+        self.profile_index_addrprep_write_seconds = 0.0
+        # One record per layer-level index update, so the report can bucket
+        # cost by tree size / anchor-vs-reuse instead of averaging it away.
+        self.profile_index_call_records = []
+        self.profile_index_call_records_cap = 4000
+        # Optional raw dump of the per-call records (JSON), for fitting
+        # T_insert(prev_num_points, ...) offline.
+        self.profile_call_dump = os.environ.get(
+            "ICECACHE_PROFILE_CALL_DUMP", "")
+        if self.profile_call_dump:
+            atexit.register(self._dump_index_call_records)
         self.profile_recall_calls = 0
         self.profile_recall_submissions = 0
         self.profile_recall_pages = 0
@@ -286,6 +315,14 @@ class InferState:
         self.profile_cross_token_reuse_calls = 0
         self.profile_cross_token_boundary_refreshes = 0
         self._profile_decode_start = None
+        # [ICECACHE-PROFILE] Optional per-decode-step latency samples, so an
+        # A/B can report TPOT spread (std / p50 / p95) rather than only a mean.
+        # Default off: `profile_step_samples` stays None and costs one compare.
+        self.profile_step_samples = (
+            [] if bool(int(os.environ.get(
+                "ICECACHE_PROFILE_STEP_SAMPLES", "0"))) else None)
+        self.profile_step_samples_cap = int(os.environ.get(
+            "ICECACHE_PROFILE_STEP_SAMPLES_CAP", "50000"))
 
         # === ICECACHE_DIAG: joint diagnostic (timing split + address mergeability) ===
         # Pure-additive, opt-in.  When ICECACHE_DIAG is unset this whole block
@@ -309,6 +346,31 @@ class InferState:
         self.diag_saved = False
         # [ICECACHE-FASTADDR] vectorised source-address construction (A/B gate)
         self.fast_addr = bool(int(os.environ.get("ICECACHE_FAST_ADDR", "1")))
+        # [ICECACHE-VECADDR] decode-side incremental DCI address preparation.
+        # `vec_addr` -> replace the per-leaf `data_ptr()` loop with NumPy
+        #                integer arithmetic over `c2p`, then hand the result to
+        #                the M-DCI binding as a plain Python list.
+        #                (Feeding the binding a NumPy array instead of a list
+        #                segfaults it -- see docs/DeepSeek_..._results.md.)
+        #                DEFAULT ON since 2026-09-14: the addresses are
+        #                bit-identical to the old path (unit + in-vivo
+        #                element-wise checks), 20-sample Qasper F1 is
+        #                unchanged (45.44 vs 45.48), and it removes ~71% of
+        #                `index_address_prepare`.  Set ICECACHE_VEC_ADDR=0 to
+        #                get the old loop back.
+        # `addr_equiv_check` -> read-only in-vivo equivalence assertion: the
+        #                vectorised formula must reproduce the per-leaf
+        #                `data_ptr()` result element for element.
+        self.vec_addr = bool(int(os.environ.get("ICECACHE_VEC_ADDR", "1")))
+        self.addr_equiv_check = bool(
+            int(os.environ.get("ICECACHE_ADDR_EQUIV_CHECK", "0")))
+        self.addr_equiv_checks = 0
+        self.addr_equiv_mismatch = 0
+        self.addr_equiv_logical_mismatch = 0
+        self.addr_equiv_by_layer = {}
+        # Distinct physical page ids seen per (layer, head) -> proves whether
+        # the CPU pool is actually fragmented during decode.
+        self.addr_equiv_phys = set()
         if self.diag_enabled:
             atexit.register(self._save_diag)
         self.nn_idx_all = None
@@ -866,8 +928,15 @@ class InferState:
         if self.profile_dci and self._profile_decode_start is not None:
             torch.cuda.synchronize(self.device)
             if self.profile_sequence_decode_steps > self.profile_warmup_tokens:
-                self.profile_decode_seconds += perf_counter() - self._profile_decode_start
+                _step_seconds = perf_counter() - self._profile_decode_start
+                self.profile_decode_seconds += _step_seconds
                 self.profile_measured_steps += 1
+                # [ICECACHE-PROFILE] Opt-in per-step samples so TPOT can be
+                # reported with a spread instead of only an aggregate mean.
+                if (self.profile_step_samples is not None
+                        and len(self.profile_step_samples)
+                        < self.profile_step_samples_cap):
+                    self.profile_step_samples.append(_step_seconds)
             self._profile_decode_start = None
 
     def _profile_is_measured_step(self):
@@ -933,6 +1002,121 @@ class InferState:
         except Exception as exc:  # never let diagnostics break a run
             print("[ICECACHE-DIAG] save failed: %r" % (exc,))
 
+    def _step_sample_stats(self):
+        """Mean / spread of the per-decode-step latencies (ms).
+
+        Only populated when ICECACHE_PROFILE_STEP_SAMPLES=1.  `n` should match
+        `decode_steps_measured`; `mean_ms` should match `decode_tpot_ms`.
+        """
+        samples = self.profile_step_samples
+        if not samples:
+            return None
+        arr = np.asarray(samples, dtype=np.float64) * 1e3
+        return {
+            "n": int(arr.size),
+            "mean_ms": float(arr.mean()),
+            "std_ms": float(arr.std(ddof=1)) if arr.size > 1 else 0.0,
+            "cv": float(arr.std(ddof=1) / arr.mean()) if arr.size > 1 else 0.0,
+            "p50_ms": float(np.percentile(arr, 50)),
+            "p95_ms": float(np.percentile(arr, 95)),
+            "min_ms": float(arr.min()),
+            "max_ms": float(arr.max()),
+        }
+
+    def _dump_index_call_records(self):
+        """atexit dump of the per-call index-update records (JSON)."""
+        if not self.profile_call_dump:
+            return
+        try:
+            import json
+
+            with open(self.profile_call_dump, "w") as fh:
+                json.dump(self.profile_index_call_records, fh)
+            print("[ICECACHE-PROFILE] %d index-update call records -> %s"
+                  % (len(self.profile_index_call_records),
+                     self.profile_call_dump))
+        except Exception as exc:  # never let diagnostics break a run
+            print("[ICECACHE-PROFILE] call dump failed: %r" % (exc,))
+
+    @staticmethod
+    def _tree_size_bucket(prev_num_points):
+        """Power-of-two bucket key for the pre-insertion tree size."""
+        p = int(prev_num_points)
+        if p < 0:
+            return "unknown"
+        if p == 0:
+            return "0"
+        lo = 1 << (p - 1).bit_length() - 1
+        return "p%d-%d" % (lo, 2 * lo - 1)
+
+    def _index_addrprep_buckets(self):
+        """Aggregate the per-call index-update records by tree size.
+
+        Answers "does the address path / native insert scale with the number of
+        points already in the tree", which a per-token average hides.
+        """
+        _MS_FIELDS = (
+            ("addr_prep_ms", "addr_prep_ms_sum"),
+            ("addr_leaf_ms", "addr_leaf_ms_sum"),
+            ("addr_np_ms", "addr_np_ms_sum"),
+            ("addr_write_ms", "addr_write_ms_sum"),
+            ("addr_meta_ms", "addr_meta_ms_sum"),
+            ("native_insert_ms", "native_insert_ms_sum"),
+            ("native_addr_update_ms", "native_addr_update_ms_sum"),
+            ("reuse_update_ms", "reuse_update_ms_sum"),
+        )
+        by_tree = {}
+        by_layer = {}
+        for rec in self.profile_index_call_records:
+            for target, mk in (
+                (by_tree, self._tree_size_bucket(rec.get("prev_num_points", -1))),
+                (by_layer, str(rec.get("layer", -1))),
+            ):
+                bucket = target.get(mk)
+                if bucket is None:
+                    bucket = {
+                        "calls": 0,
+                        "anchor_calls": 0,
+                        "reuse_calls": 0,
+                        "insert_tokens": 0,
+                        "new_leaves_total": 0,
+                        "new_leaves_max": 0,
+                        "prev_num_points_min": None,
+                        "prev_num_points_max": None,
+                    }
+                    for _, sum_key in _MS_FIELDS:
+                        bucket[sum_key] = 0.0
+                    target[mk] = bucket
+                bucket["calls"] += 1
+                if rec.get("anchor"):
+                    bucket["anchor_calls"] += 1
+                else:
+                    bucket["reuse_calls"] += 1
+                bucket["insert_tokens"] += int(rec.get("insert_tokens", 0))
+                bucket["new_leaves_total"] += int(rec.get("new_leaves_total", 0))
+                bucket["new_leaves_max"] = max(
+                    bucket["new_leaves_max"], int(rec.get("new_leaves_max", 0)))
+                pnp = int(rec.get("prev_num_points", -1))
+                if pnp >= 0:
+                    if bucket["prev_num_points_min"] is None:
+                        bucket["prev_num_points_min"] = pnp
+                        bucket["prev_num_points_max"] = pnp
+                    else:
+                        bucket["prev_num_points_min"] = min(
+                            bucket["prev_num_points_min"], pnp)
+                        bucket["prev_num_points_max"] = max(
+                            bucket["prev_num_points_max"], pnp)
+                for src, sum_key in _MS_FIELDS:
+                    bucket[sum_key] += float(rec.get(src, 0.0))
+
+        for target in (by_tree, by_layer):
+            for bucket in target.values():
+                calls = max(bucket["calls"], 1)
+                for src, sum_key in _MS_FIELDS:
+                    bucket[src.replace("_ms", "_ms_per_call")] = (
+                        bucket.pop(sum_key) / calls)
+        return {"by_tree_size": by_tree, "by_layer": by_layer}
+
     def get_profile_stats(self):
         """Return aggregate steady-state decode timing statistics in seconds."""
         measured = self.profile_measured_steps
@@ -945,6 +1129,7 @@ class InferState:
             "dci_select_seconds": self.profile_dci_seconds,
             "dci_select_calls": self.profile_dci_calls,
             "decode_tpot_ms": 1000 * self.profile_decode_seconds / measured if measured else None,
+            "decode_step_latency": self._step_sample_stats(),
             "dci_select_ms_per_token": 1000 * self.profile_dci_seconds / measured if measured else None,
             "dci_share": self.profile_dci_seconds / self.profile_decode_seconds if self.profile_decode_seconds else None,
             "dci_calls_per_token": self.profile_dci_calls / measured if measured else None,
@@ -965,6 +1150,23 @@ class InferState:
             "recall_wait_ms_per_token": 1000 * self.profile_recall_wait_seconds / measured if measured else None,
             "page_metadata_ms_per_token": 1000 * self.profile_page_metadata_seconds / measured if measured else None,
             "index_update_ms_per_token": 1000 * self.profile_index_update_seconds / measured if measured else None,
+            "index_pack_ms_per_token": 1000 * self.profile_index_pack_seconds / measured if measured else None,
+            "index_numpy_ms_per_token": 1000 * self.profile_index_numpy_seconds / measured if measured else None,
+            "index_prepare_ms_per_token": 1000 * self.profile_index_prepare_seconds / measured if measured else None,
+            "index_native_insert_ms_per_token": 1000 * self.profile_index_native_insert_seconds / measured if measured else None,
+            "index_ccc_writeback_ms_per_token": 1000 * self.profile_index_ccc_writeback_seconds / measured if measured else None,
+            "index_page_alloc_ms_per_token": 1000 * self.profile_index_page_alloc_seconds / measured if measured else None,
+            "index_address_update_ms_per_token": 1000 * self.profile_index_address_update_seconds / measured if measured else None,
+            "index_address_prepare_ms_per_token": 1000 * self.profile_index_address_prepare_seconds / measured if measured else None,
+            "index_native_address_update_ms_per_token": 1000 * self.profile_index_native_address_update_seconds / measured if measured else None,
+            "index_reuse_update_ms_per_token": 1000 * self.profile_index_reuse_update_seconds / measured if measured else None,
+            "index_addrprep_meta_ms_per_token": 1000 * self.profile_index_addrprep_meta_seconds / measured if measured else None,
+            "index_addrprep_leaf_ms_per_token": 1000 * self.profile_index_addrprep_leaf_seconds / measured if measured else None,
+            "index_addrprep_np_ms_per_token": 1000 * self.profile_index_addrprep_np_seconds / measured if measured else None,
+            "index_addrprep_write_ms_per_token": 1000 * self.profile_index_addrprep_write_seconds / measured if measured else None,
+            "index_addrprep_buckets": self._index_addrprep_buckets(),
+            "addr_equiv": (self.get_addr_equiv_stats()
+                           if self.addr_equiv_check else None),
             "recall_calls_per_token": self.profile_recall_calls / measured if measured else None,
             "recall_submissions_per_token": self.profile_recall_submissions / measured if measured else None,
             "recall_pages_per_token": self.profile_recall_pages / measured if measured else None,
@@ -1337,8 +1539,84 @@ class InferState:
                 DCI.reuse_copy_node(p_index=old_index, p_offset=old_offset, keys=_key_states, values=_value_states, new_address=[cast(_base + i * head_offset, c_void_p).value for i in range(self.n_kv_heads)], kv_offset=self.n_kv_heads*self.page_size*self.head_dim)
 
 
+    @staticmethod
+    def page_address_formula(pool_base, physical_ids, page_stride, head_offset):
+        """Physical CPU-side byte address of a KV head inside a page.
+
+        The CPU KV pool is a single contiguous pinned tensor and `page_stride`
+        is `cpu_n_bytes_per_page`, so page `p` starts at
+        `pool_base + p * page_stride`.  `physical_ids` must already be mapped
+        through `c2p`: the pool is fragmented during decode (pages are handed
+        out from a free-id set and reused in place), so a logical cache page id
+        is NOT a physical page id.
+        """
+        return (np.uintp(pool_base)
+                + np.asarray(physical_ids, dtype=np.uintp) * np.uintp(page_stride)
+                + np.uintp(head_offset))
+
+    def _addr_equiv_probe(self, cur_id, b, inst, c2p_np, pool_base,
+                          logical_ids, head_offset, slow_addr):
+        """Read-only equivalence check; raises on any mismatch."""
+        physical_ids = c2p_np[b, logical_ids]
+        fast = self.page_address_formula(
+            pool_base, physical_ids, self.cpu_n_bytes_per_page, head_offset)
+        # Deliberately *not* the production formula: this is the tempting
+        # "logical page id == physical page id" shortcut we want to falsify.
+        logical = self.page_address_formula(
+            pool_base, logical_ids, self.cpu_n_bytes_per_page, head_offset)
+        slow = np.asarray(slow_addr, dtype=np.uintp)
+        n = int(slow.size)
+        bad_fast = int(np.count_nonzero(fast != slow))
+        bad_logical = int(np.count_nonzero(logical != slow))
+        self.addr_equiv_checks += n
+        self.addr_equiv_mismatch += bad_fast
+        self.addr_equiv_logical_mismatch += bad_logical
+        self.addr_equiv_phys.update(
+            int(x) for x in np.unique(np.asarray(physical_ids, dtype=np.int64)))
+        key = "%d" % int(cur_id)
+        rec = self.addr_equiv_by_layer.get(key)
+        if rec is None:
+            rec = [0, 0, 0]
+            self.addr_equiv_by_layer[key] = rec
+        rec[0] += n
+        rec[1] += bad_fast
+        rec[2] += bad_logical
+        if bad_fast:
+            raise AssertionError(
+                "[ICECACHE-ADDR-EQUIV] vectorised address mismatch: layer=%d "
+                "head=%d n=%d (mismatched=%d)"
+                % (cur_id, inst, n, bad_fast))
+
+    def get_addr_equiv_stats(self):
+        return {
+            "vec_addr": self.vec_addr,
+            "checks": self.addr_equiv_checks,
+            "fast_mismatch": self.addr_equiv_mismatch,
+            "logical_shortcut_mismatch": self.addr_equiv_logical_mismatch,
+            "distinct_physical_pages": len(self.addr_equiv_phys),
+            "by_layer": {
+                layer: {"n": v[0], "fast_mismatch": v[1],
+                        "logical_shortcut_mismatch": v[2]}
+                for layer, v in sorted(
+                    self.addr_equiv_by_layer.items(), key=lambda kv: int(kv[0]))
+            },
+        }
+
     def _DCI_add(self, b, cur_id, key_states, value_states):
         if self.use_dci:
+            profile_stage = self._profile_is_measured_step()
+            stage_start = perf_counter() if profile_stage else None
+
+            # Per-call record, only materialised while profiling.  It is filled
+            # in stage by stage and appended at the end of the function.
+            _call_rec = None
+            if profile_stage:
+                _reuse_of = self.check_reuse(cur_id)
+                _call_rec = {
+                    "layer": int(cur_id),
+                    "anchor": _reuse_of == 0,
+                    "reuse_of": int(_reuse_of),
+                }
 
             dci_len = key_states.shape[1]
 
@@ -1348,6 +1626,9 @@ class InferState:
 
             assert (_key_states.flags['C_CONTIGUOUS'])
             assert (_value_states.flags['C_CONTIGUOUS'])
+            if stage_start is not None:
+                self.profile_index_numpy_seconds += perf_counter() - stage_start
+                stage_start = perf_counter()
 
             cpu_cache = self.cpu_kv_caches[cur_id]
             kvc = self.kv_caches[cur_id]
@@ -1377,6 +1658,10 @@ class InferState:
                 ccc = kvc.ccc[b][:, :prev_max_num_pages].numpy().astype(
                     np.bool_).reshape(self.batch_size*self.n_kv_heads, -1)
 
+                if stage_start is not None:
+                    self.profile_index_prepare_seconds += perf_counter() - stage_start
+                    native_insert_start = perf_counter()
+
                 _, _ = self.dci_db[cur_id].add_query(_key_states, None, _value_states,
                                                     padding_mask,
                                                     num_levels=-100,  # not used
@@ -1402,8 +1687,19 @@ class InferState:
                                                     changed_page_list=ccc,
                                                     )
 
+                if stage_start is not None:
+                    _native_insert_s = perf_counter() - native_insert_start
+                    self.profile_index_native_insert_seconds += _native_insert_s
+                    writeback_start = perf_counter()
+                    if _call_rec is not None:
+                        _call_rec["native_insert_ms"] = 1e3 * _native_insert_s
+
                 kvc.ccc[b][:, :prev_max_num_pages] = torch.tensor(
                     ccc, **self._cb).reshape(self.n_kv_heads, -1)
+                if stage_start is not None:
+                    self.profile_index_ccc_writeback_seconds += (
+                        perf_counter() - writeback_start)
+                    page_alloc_start = perf_counter()
                 
                 dci_db = self.dci_db[cur_id]
             else:
@@ -1411,6 +1707,16 @@ class InferState:
                 dci_db = self.dci_db[reuse_id]
                 kvc.ccc = self.kv_caches[reuse_id].ccc.clone()
                 reuse_ccc = kvc.ccc[b][:, :dci_db.num_leaves.max()].numpy().astype(np.bool_).reshape(self.batch_size*self.n_kv_heads, -1)
+
+            if profile_stage:
+                page_alloc_start = perf_counter()
+
+            if _call_rec is not None:
+                _call_rec["prev_num_points"] = (
+                    int(self.prev_num_points)
+                    if self.prev_num_points is not None else -1)
+                _call_rec["insert_tokens"] = int(dci_len)
+                _call_rec["n_heads"] = int(self.n_kv_heads)
 
             # For DCI tokens
             max_num_pages = dci_db.num_leaves.max()
@@ -1446,30 +1752,124 @@ class InferState:
                         axis=-1,
                     )
 
+            if profile_stage:
+                self.profile_index_page_alloc_seconds += (
+                    perf_counter() - page_alloc_start)
+                address_update_start = perf_counter()
+
             # Use the new allocated pages to store the DCI tokens
+            _ap_meta_start = perf_counter() if profile_stage else None
             new_num_leaves = dci_db.num_leaves - self.prev_num_pages
             new_address = [None] * self.n_kv_heads
             # !! Here assume batch size = 1
             offset = self.page_size * self.head_dim * self.cpu_dtype.itemsize
             new_indices = np.zeros(
                 [self.n_kv_heads, new_num_leaves.max()], dtype=np.int32)
+            # [ICECACHE-VECADDR] Zero-copy view of the logical->physical page
+            # map.  `c2p` lives on the CPU cache and is never reallocated in
+            # place (it is rebuilt by `utils.cat`), so a per-call view is safe.
+            _vec_on = self.vec_addr or self.addr_equiv_check
+            c2p_np = None
+            pool_base = 0
+            if _vec_on:
+                c2p_np = cpu_cache.c2p.numpy()
+                pool_base = cpu_cache.pool.buffer.data_ptr()
+            if _ap_meta_start is not None:
+                self.profile_index_addrprep_meta_seconds += (
+                    perf_counter() - _ap_meta_start)
+                _ap_leaf_seconds = 0.0
+                _ap_np_seconds = 0.0
+                _ap_write_seconds = 0.0
+                _ap_leaves_total = 0
+                _ap_leaves_max = 0
             for inst in range(self.n_kv_heads):
                 if new_num_leaves[inst] == 0:
                     new_address[inst] = []
                     continue
                 tmp_new_indices = np.arange(self.prev_num_pages[inst], dci_db.num_leaves[inst])
                 new_indices[inst, :new_num_leaves[inst]] = tmp_new_indices
-                tmp_addr = [cast(cpu_cache[b, j].data_ptr() + inst * offset, c_void_p).value for j in tmp_new_indices]
+                _ap_t0 = perf_counter() if profile_stage else None
+                if self.vec_addr:
+                    _ap_arr = self.page_address_formula(
+                        pool_base, c2p_np[b, tmp_new_indices],
+                        self.cpu_n_bytes_per_page, inst * offset)
+                    _ap_t1 = perf_counter() if profile_stage else None
+                    # The M-DCI binding takes a plain list of ints here; a
+                    # NumPy array is not interchangeable (it segfaults).
+                    tmp_addr = _ap_arr.tolist()
+                else:
+                    tmp_addr = [cast(cpu_cache[b, j].data_ptr() + inst * offset, c_void_p).value for j in tmp_new_indices]
+                    _ap_t1 = perf_counter() if profile_stage else None
+                    _ap_arr = np.array(tmp_addr, dtype=np.uintp)
+                if _ap_t0 is not None:
+                    _ap_t2 = perf_counter()
+                    _ap_leaf_seconds += _ap_t1 - _ap_t0
+                    _ap_np_seconds += _ap_t2 - _ap_t1
+                    _ap_leaves_total += len(tmp_addr)
+                    if len(tmp_addr) > _ap_leaves_max:
+                        _ap_leaves_max = len(tmp_addr)
                 new_address[inst] = tmp_addr
-                self.page_address_buffer[cur_id][b, inst, tmp_new_indices] = np.array(tmp_addr, dtype=np.uintp)
+                self.page_address_buffer[cur_id][b, inst, tmp_new_indices] = _ap_arr
+                if self.addr_equiv_check:
+                    # Reference must always be the true per-leaf data_ptr()
+                    # path, even when the fast path is the one in production.
+                    if self.vec_addr:
+                        _slow_ref = [
+                            cast(cpu_cache[b, j].data_ptr() + inst * offset,
+                                 c_void_p).value
+                            for j in tmp_new_indices]
+                    else:
+                        _slow_ref = tmp_addr
+                    self._addr_equiv_probe(
+                        cur_id, b, inst, c2p_np, pool_base,
+                        tmp_new_indices, inst * offset, _slow_ref)
+                if _ap_t0 is not None:
+                    _ap_write_seconds += perf_counter() - _ap_t2
+
+            if profile_stage:
+                _ap_end = perf_counter()
+                self.profile_index_addrprep_leaf_seconds += _ap_leaf_seconds
+                self.profile_index_addrprep_np_seconds += _ap_np_seconds
+                self.profile_index_addrprep_write_seconds += _ap_write_seconds
+                self.profile_index_address_prepare_seconds += (
+                    _ap_end - address_update_start)
+                _call_rec["addr_prep_ms"] = 1e3 * (_ap_end - address_update_start)
+                _call_rec["addr_meta_ms"] = 1e3 * (
+                    _ap_end - address_update_start) - 1e3 * (
+                    _ap_leaf_seconds + _ap_np_seconds + _ap_write_seconds)
+                _call_rec["addr_leaf_ms"] = 1e3 * _ap_leaf_seconds
+                _call_rec["addr_np_ms"] = 1e3 * _ap_np_seconds
+                _call_rec["addr_write_ms"] = 1e3 * _ap_write_seconds
+                _call_rec["new_leaves_total"] = int(_ap_leaves_total)
+                _call_rec["new_leaves_max"] = int(_ap_leaves_max)
 
             if self.check_reuse(cur_id) == 0:
+                native_address_start = perf_counter() if profile_stage else None
                 dci_db.address_update(indices=new_indices, new_address=new_address,
                                                num_pages=new_num_leaves, offset=self.n_kv_heads*self.page_size*self.head_dim)
+                if native_address_start is not None:
+                    _native_addr_s = perf_counter() - native_address_start
+                    self.profile_index_native_address_update_seconds += _native_addr_s
+                    if _call_rec is not None:
+                        _call_rec["native_addr_update_ms"] = 1e3 * _native_addr_s
             else:
                 old_index, old_offset = self.prev_index, self.prev_offset
                 new_index, new_offset = dci_db.token2node
+                reuse_update_start = perf_counter() if profile_stage else None
                 DCI.reuse_update_node(old_index=old_index, old_offset=old_offset, new_index=new_index, new_offset=new_offset, keys=_key_states, values=_value_states, new_address=self.page_address_buffer[cur_id][0], kv_offset=self.n_kv_heads*self.page_size*self.head_dim, ccc=reuse_ccc, num_leaves=dci_db.num_leaves)
+                if reuse_update_start is not None:
+                    _reuse_update_s = perf_counter() - reuse_update_start
+                    self.profile_index_reuse_update_seconds += _reuse_update_s
+                    if _call_rec is not None:
+                        _call_rec["reuse_update_ms"] = 1e3 * _reuse_update_s
+
+            if profile_stage:
+                _addr_update_s = perf_counter() - address_update_start
+                self.profile_index_address_update_seconds += _addr_update_s
+                if _call_rec is not None:
+                    _call_rec["addr_update_ms"] = 1e3 * _addr_update_s
+                if len(self.profile_index_call_records) < self.profile_index_call_records_cap:
+                    self.profile_index_call_records.append(_call_rec)
 
 
     def _DCI_query(self, b, cur_id, query_states):
@@ -2028,8 +2428,13 @@ class InferState:
         if kvc.budget is None:
             return
         for i in range(win_kvc.batch_size):
+            pack_start = (
+                perf_counter() if self._profile_is_measured_step() else None
+            )
             sub_kv_states = win_kvc[i, :self.num_evict_win].permute(1, 0, 2, 3, 4).permute(
                 0, 2, 1, 3, 4).reshape(2, self.n_kv_heads, -1, self.head_dim)
+            if pack_start is not None:
+                self.profile_index_pack_seconds += perf_counter() - pack_start
             self._DCI_add(i, layer_idx, sub_kv_states[0], sub_kv_states[1])
         if update_start is not None:
             self.profile_index_update_seconds += perf_counter() - update_start
