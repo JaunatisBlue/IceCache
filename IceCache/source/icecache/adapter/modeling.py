@@ -489,6 +489,9 @@ def _icecache_attn_forward(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     from icecache.batch import BatchInferState
     if isinstance(infer_state, BatchInferState):
+        if infer_state.forward_mode == ForwardMode.BATCH_PREFILL:
+            return infer_state.prefill_attention_forward(
+                self, hidden_states, position_embeddings, output_attentions)
         return infer_state.attention_forward(
             self, hidden_states, position_embeddings, output_attentions)
     _, q_len, _ = hidden_states.size()

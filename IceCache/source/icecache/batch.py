@@ -12,9 +12,11 @@ contain a scheduler: :meth:`admit` is called explicitly by the caller.
 
 import os
 import hashlib
+import warnings
 from pathlib import Path
 from threading import Lock, get_ident
 from time import perf_counter
+import asyncio
 
 import numpy as np
 import torch
@@ -33,6 +35,11 @@ _CONFIG_ATTRS = (
     "n_groups", "offload_ratio", "ratio", "search_ratio", "use_dci",
 )
 
+# FlashInfer scratch space reserved per concurrent request row.  The serial path
+# allocates 16 MiB per handler (infer_state.py builds one buffer per budget
+# group), which is the figure this mirrors.  See BatchInferState._workspace_bytes.
+_WORKSPACE_PER_REQUEST = 16 * 1024 * 1024
+
 
 class BatchInferState:
     """Synchronous decode over a fixed-capacity set of independently prefilled requests.
@@ -44,7 +51,7 @@ class BatchInferState:
     prefilled request into it.
     """
 
-    def __init__(self, states, query_backend="serial", query_threads=32):
+    def __init__(self, states, query_backend="serial", query_threads=32, prefilled=True):
         if len(states) < 1:
             raise ValueError("the batch prototype needs at least one prefilled request")
         self.capacity = len(states)
@@ -52,7 +59,8 @@ class BatchInferState:
         self._ref_state = states[0]
         self._pool = states[0]._pool
         for i, state in enumerate(self.states):
-            self._check_prefilled(state, i)
+            if prefilled:
+                self._check_prefilled(state, i)
             self._check_compatible(state, i)
         a = states[0]
         self.n_layers = a.n_layers
@@ -79,8 +87,22 @@ class BatchInferState:
             if producer_sha != _mdci_batch.producer_sha256:
                 raise RuntimeError("M-DCI producer binary changed; rebuild and validate the batch extension")
             self._native = _mdci_batch
-        self._workspace = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device=self.device)
+        # Workspace shared by the decode and prefill wrappers.  The serial path
+        # does exactly the same: infer_state.py builds one 16 MiB buffer per
+        # budget group and hands that same buffer to the group's prefill *and*
+        # decode wrappers, so sharing here mirrors the reference rather than
+        # inventing anything.  Size it from the *live* row count rather than the
+        # slot capacity (a capacity larger than the active set would otherwise
+        # reserve memory for rows that never exist) and grow it on demand in
+        # _ensure_workspace.
+        self._workspace = torch.empty(
+            self._workspace_bytes(len(self.active_indices)),
+            dtype=torch.uint8, device=self.device)
+        self.workspace_bytes = self._workspace.numel()
         self._handler = kernels.BatchDecodeWithPagedKVCacheWrapper(self._workspace, self.layout)
+        self._prefill_handler = kernels.BatchPrefillWithPagedKVCacheWrapper(self._workspace, self.layout)
+        self._prefill_real_lens = None
+        self._prefill_lmax = 0
         # Per-slot containers indexed by slot index; length stays at capacity so
         # callers can read a slot by index.  Inactive slots keep their last value
         # but are never incremented (and are reset on admit).
@@ -99,7 +121,12 @@ class BatchInferState:
         self._query_active = False
         self._next_layer = 0
         self._decode_handlers_armed = False
-        self.validate_ready()
+        # Only a batch of already-prefilled requests can be validated here.  With
+        # ``prefilled=False`` the members have no KvCache yet (kv_caches is still
+        # [None] * n_layers), so validate_ready() would dereference None; the
+        # check runs after prefill_batch instead (step/_step_impl re-validates).
+        if prefilled:
+            self.validate_ready()
 
     # ------------------------------------------------------------------ #
     # Slot bookkeeping
@@ -146,6 +173,47 @@ class BatchInferState:
         if self._forward_lock.locked() and self._step_thread != get_ident():
             raise RuntimeError("batch step is being prepared by another call")
 
+    # ------------------------------------------------------------------ #
+    # Workspace sizing
+    # ------------------------------------------------------------------ #
+    def _workspace_bytes(self, n_requests):
+        """Bytes of FlashInfer scratch space for ``n_requests`` concurrent rows.
+
+        The serial path gives every handler 16 MiB (``infer_state.py`` builds one
+        such buffer per budget group), so a batch of B rows is sized at B x 16 MiB
+        -- a conservative reading of the existing allocation, not a characterised
+        requirement.  ``ICECACHE_BATCH_WORKSPACE_MB`` overrides it wholesale.
+        """
+        override = os.environ.get("ICECACHE_BATCH_WORKSPACE_MB")
+        if override:
+            try:
+                mib = int(override)
+            except ValueError:
+                raise ValueError("ICECACHE_BATCH_WORKSPACE_MB must be an integer")
+            if mib < 1:
+                raise ValueError("ICECACHE_BATCH_WORKSPACE_MB must be positive")
+            return mib * 1024 * 1024
+        need = _WORKSPACE_PER_REQUEST * max(1, int(n_requests))
+        if need > (1 << 30):
+            warnings.warn(
+                f"batch workspace would be {need >> 20} MiB for {n_requests} rows; "
+                "set ICECACHE_BATCH_WORKSPACE_MB to override if unintended",
+                stacklevel=2)
+        return need
+
+    def _ensure_workspace(self, n_requests):
+        """Grow the shared workspace if the batch now needs more than it has."""
+        need = self._workspace_bytes(n_requests)
+        if need <= self.workspace_bytes:
+            return self.workspace_bytes
+        self._workspace = torch.empty(need, dtype=torch.uint8, device=self.device)
+        self.workspace_bytes = self._workspace.numel()
+        # The decode and prefill wrappers share this buffer, so both must be
+        # re-pointed at the new one.
+        self._handler.reset_workspace_buffer(self._workspace)
+        self._prefill_handler.reset_workspace_buffer(self._workspace)
+        return self.workspace_bytes
+
     def _check_prefilled(self, state, i):
         if (len(state.kv_caches) != state.n_layers or
                 any(cache is None for cache in state.kv_caches) or
@@ -178,6 +246,253 @@ class BatchInferState:
     def from_prefilled(cls, states, **kwargs):
         """Construct a batch from requests independently prefilled in one pool."""
         return cls(states, **kwargs)
+
+    # ------------------------------------------------------------------ #
+    # Batched prefill: one model forward over B padded prompts
+    # ------------------------------------------------------------------ #
+    def prefill_batch(self, model, prompts):
+        # Prefill every active request with a *single* model forward.  ``prompts``
+        # is a list of 1-D LongTensor token ids, one per active slot in
+        # ``active_indices`` order.  The prompts are padded to a dense [B, Lmax]
+        # grid and fed to ``model(...)`` once.  Padding is excluded everywhere:
+        # each request writes only its real tokens into its OWN KvCache (the b == 0
+        # assumption is preserved, every member still has batch_size == 1), the
+        # FlashInfer prefill attention is a ragged batch keyed by each request's
+        # real length, and each DCI tree is still built independently via the
+        # unchanged per-request ``_DCI_*`` methods.  After the forward each member
+        # is fully prefilled and ready for :meth:`step`.
+        #
+        # Returns ``(logits, next_tokens)`` where ``logits`` has shape
+        # [B, Lmax, vocab] (the LM head is temporarily un-truncated so every
+        # request's last real token is readable) and ``next_tokens[i]`` is the
+        # argmax of ``logits[i, L_i - 1]``.
+        from .adapter.modeling import icecache_state
+        from .infer_state import ForwardMode
+
+        active = self.active_indices
+        if len(prompts) != len(active):
+            raise ValueError("prompts length must match the number of active slots")
+        # Guarantee the shared workspace covers this many concurrent rows before
+        # any wrapper touches it.
+        self._ensure_workspace(len(active))
+        real_lens = [int(p.shape[0]) for p in prompts]
+        if any(L < 2 for L in real_lens):
+            raise ValueError("batched prefill requires q_len > 1 for every request")
+        Lmax = max(real_lens)
+        Bnum = len(active)
+        device = self.device
+
+        # Per-request prefill setup.  This resets each member's KvCache/handlers
+        # and arms its DCI index exactly like the serial _icecache_prefill path;
+        # b == 0 semantics are preserved because every InferState stays
+        # batch_size == 1.
+        for pos, i in enumerate(active):
+            state = self.states[i]
+            state._prepare_prefill(1, real_lens[pos])
+            state._dci_future = None
+
+        # Pad to a dense grid; padding positions are excluded downstream.
+        input_ids = torch.zeros(Bnum, Lmax, dtype=torch.long, device=device)
+        position_ids = torch.zeros(Bnum, Lmax, dtype=torch.long, device=device)
+        for pos, i in enumerate(active):
+            L = real_lens[pos]
+            input_ids[pos, :L] = prompts[pos]
+            position_ids[pos, :L] = torch.arange(L, device=device)
+
+        self._prefill_real_lens = real_lens
+        self._prefill_lmax = Lmax
+
+        # Hold the same lock ``step`` uses: ``lm_head`` is patched for the whole
+        # duration of this forward, so a concurrent batched decode step must not
+        # interleave (it would observe the un-truncated head).
+        if not self._forward_lock.acquire(blocking=False):
+            raise RuntimeError("another batch forward is already active")
+        self._step_thread = get_ident()
+        self.forward_mode = ForwardMode.BATCH_PREFILL
+        # The patched LM head truncates to the last position only; restore full
+        # logits for the duration of the prefill so per-request last tokens can be
+        # read.  Saved/restored so the decode path is left unchanged.
+        _saved_lm = model.lm_head.forward
+        model.lm_head.forward = (
+            lambda x: torch.nn.functional.linear(
+                x, model.lm_head.weight, model.lm_head.bias))
+        try:
+            with icecache_state(model, self):
+                out = model(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    cache_position=torch.arange(Lmax, device=device),
+                    use_cache=False,
+                    return_dict=True,
+                )
+        finally:
+            model.lm_head.forward = _saved_lm
+            self.forward_mode = ForwardMode.DECODE
+            self._step_thread = None
+            self._forward_lock.release()
+
+        # Finalize: await the last DCI eviction and finish each prefill.
+        next_tokens = []
+        for pos, i in enumerate(active):
+            state = self.states[i]
+            if state._dci_future is not None:
+                state._dci_future.result()
+                state._dci_future = None
+            state._finish_prefill(1, real_lens[pos])
+            # A prompt that fits the page budget legitimately stays non-sparse:
+            # the serial path sets use_dci = False and builds no tree for it, and
+            # the decode path already handles a non-sparse member.  Only require
+            # the trees once the request actually entered DCI mode.
+            if state.use_dci and any(db is None for db in state.dci_db):
+                raise AssertionError(
+                    "request %d did not build every DCI tree during batched prefill" % i)
+            # keepdim=True -> [1] shape, matching the serial path's tokens[i] used by run_steps
+            next_tokens.append(out.logits[pos, real_lens[pos] - 1].argmax(dim=-1, keepdim=True))
+        return out, next_tokens
+
+    def prefill_attention_forward(self, attn, hidden_states, position_embeddings,
+                                 output_attentions=False):
+        # Layer attention for :meth:`prefill_batch` -- one ragged FlashInfer
+        # prefill over all requests' real tokens.  Mirrors
+        # adapter.modeling._icecache_prefill: q/k/v projections run once over the
+        # padded [B, Lmax, hidden] grid, then per active request we (a) write only
+        # the real tokens into that request's own KvCache (b == 0), (c) async-evict
+        # and build that request's DCI tree via the unchanged per-request methods.
+        # The attention itself is a single BatchPrefillWithPagedKVCacheWrapper call
+        # whose qo_indptr / paged_kv_indptr are the per-request real-length CSR, so
+        # padding tokens are never attended to or used as KV.
+        from .adapter.modeling import apply_rotary_pos_emb
+
+        bsz, q_len, _ = hidden_states.shape
+        if bsz != self.batch_size:
+            raise ValueError("batched prefill expects one padded row per active request")
+        if q_len != self._prefill_lmax:
+            raise ValueError("batched prefill q_len must equal the padded Lmax")
+        if output_attentions:
+            raise ValueError("batched prefill does not return attention weights")
+
+        layer_idx = attn.layer_idx
+        cfg = attn.config
+        active = self.active_indices
+        real_lens = self._prefill_real_lens
+        nh = cfg.num_attention_heads
+        nkv = cfg.num_key_value_heads
+        hd = self.head_dim
+
+        # q/k/v projection (vectorized over all padded rows).
+        if getattr(cfg, "pretraining_tp", 1) > 1:
+            kvs = (nkv * hd) // cfg.pretraining_tp
+            qs = (nh * hd) // cfg.pretraining_tp
+            query_states = torch.cat(
+                [F.linear(hidden_states, w) for w in attn.q_proj.weight.split(qs, dim=0)], dim=-1)
+            key_states = torch.cat(
+                [F.linear(hidden_states, w) for w in attn.k_proj.weight.split(kvs, dim=0)], dim=-1)
+            value_states = torch.cat(
+                [F.linear(hidden_states, w) for w in attn.v_proj.weight.split(kvs, dim=0)], dim=-1)
+        else:
+            query_states = attn.q_proj(hidden_states)
+            key_states = attn.k_proj(hidden_states)
+            value_states = attn.v_proj(hidden_states)
+
+        if "qwen3" in cfg._name_or_path.lower():
+            query_states = attn.q_norm(query_states.view(bsz, q_len, nh, hd)).transpose(1, 2)
+            key_states = attn.k_norm(key_states.view(bsz, q_len, nkv, hd)).transpose(1, 2)
+        else:
+            query_states = query_states.view(bsz, q_len, nh, hd).transpose(1, 2)
+            key_states = key_states.view(bsz, q_len, nkv, hd).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, nkv, hd)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Mirror the serial _icecache_prefill layout exactly.  After apply_rotary
+        # the tensors are [B, heads, Lmax, hd]; query/key are transposed to the
+        # token-major [B, Lmax, heads, hd] that append_paged_kv_cache and
+        # prefill_sdpa expect, while value is *not* transposed -- its projection
+        # already produced [B, Lmax, nkv, hd].  Transposing value here (as an
+        # earlier revision did) yields a strided [B, nkv, Lmax, hd] whose real
+        # slice is non-contiguous, and the append kernel rejects it with
+        # "v must be contiguous".
+        query_states = query_states.transpose(1, 2).contiguous()   # [B, Lmax, n_qo_heads, hd]
+        key_states = key_states.transpose(1, 2).contiguous()       # [B, Lmax, n_kv_heads, hd]
+        value_states = value_states.contiguous()                   # [B, Lmax, n_kv_heads, hd]
+
+        flat_queries = []
+        global_page_indices = []
+        kv_indptr_parts = [0]
+        qo_indptr_parts = [0]
+        last_page_lens = []
+        out_slices = []  # (row, start_q, L_i)
+        for pos, i in enumerate(active):
+            state = self.states[i]
+            L_i = int(real_lens[pos])
+            # Token-major slices: dim 1 is the token axis, so [pos, :L_i] keeps
+            # exactly this request's real tokens and drops the padded tail.
+            # (Indexing dim 2 instead would truncate the head axis and slice
+            # nothing off the tokens, writing Lmax tokens into an L_i-token cache.)
+            q_i = query_states[pos, :L_i]                # [L_i, n_qo_heads, hd]
+            k_i = key_states[pos, :L_i].contiguous()     # [L_i, n_kv_heads, hd]
+            v_i = value_states[pos, :L_i].contiguous()   # [L_i, n_kv_heads, hd]
+
+            # (a) KV write: only the real tokens, into this request's own cache.
+            state.kv_caches[layer_idx].prefill_alloc_n_tokens(L_i, state.alloc_page)
+            state.append_paged_kv_cache(layer_idx, k_i[None], v_i[None])
+
+            # (c) DCI eviction / tree build -- async, unchanged per-request path.
+            if state._dci_future is not None:
+                state._dci_future.result()
+                state._dci_future = None
+            projected = None
+            if state.layer2budget[layer_idx] is not None:
+                start = state.n_sink_pages * state.page_size
+                end = (state.n_kv_pages - state.n_win_pages) * state.page_size
+                kr = k_i.reshape(state.n_kv_heads, -1, state.head_dim)[:, start:end, :]
+                projected = torch.matmul(kr, state.proj_vec[:-1]).reshape(-1, 1)
+            # query_states is [B, Lmax, n_qo_heads, hd] (token-major), so the last
+            # *real* token of this request is dim 1 -- matching the serial
+            # path's query_states[:, -1:, ...] on its [B, L, heads, hd] tensor.
+            state._dci_future = asyncio.run_coroutine_threadsafe(
+                state.prefill_evict_extra_pages_wrapper(
+                    layer_idx, query_states[pos:pos + 1, -1:, :, :].contiguous(), projected),
+                state._loop)
+
+            # Ragged-attention metadata for this request.
+            kvc = state.kv_caches[layer_idx]
+            n_pages = int(kvc.n_real_pages)
+            global_page_indices.append(kvc.c2p[0, :n_pages].to(self.device).to(torch.int32))
+            kv_indptr_parts.append(kv_indptr_parts[-1] + n_pages)
+            last_page_lens.append(int(kvc.last_page_len))
+            # q_i is already token-major [L_i, n_qo_heads, hd], which is exactly
+            # the [total_tokens, n_qo_heads, hd] row order the ragged prefill
+            # wrapper wants (it reshapes q to (-1, *q.shape[-2:]) internally).
+            flat_queries.append(q_i.contiguous())
+            start_q = qo_indptr_parts[-1]
+            qo_indptr_parts.append(start_q + L_i)
+            out_slices.append((pos, start_q, L_i))
+
+        # One batched ragged FlashInfer prefill over all real tokens.
+        flat_q = torch.cat(flat_queries, dim=0)                            # [total, n_qo_heads, hd]
+        global_indices = torch.cat(global_page_indices).to(torch.int32).to(self.device)
+        qo_indptr = torch.tensor(qo_indptr_parts, dtype=torch.int32, device=self.device)
+        kv_indptr = torch.tensor(kv_indptr_parts, dtype=torch.int32, device=self.device)
+        last_page_len = torch.tensor(last_page_lens, dtype=torch.int32, device=self.device)
+        self._prefill_handler.begin_forward(
+            qo_indptr, kv_indptr, last_page_len, self.n_qo_heads, self.n_kv_heads, self.head_dim)
+        attn_output_flat = self._prefill_handler.forward(flat_q, self._pool.buffer, global_indices)
+        self._prefill_handler.end_forward()
+
+        # Scatter the flattened output back into the padded [B, Lmax, hidden].
+        attn_output = attn_output_flat.new_zeros(bsz, q_len, self.n_qo_heads * hd)
+        for pos, start_q, L_i in out_slices:
+            attn_output[pos, :L_i] = attn_output_flat[start_q:start_q + L_i].reshape(L_i, -1)
+
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+        if "llama" in cfg._name_or_path and getattr(cfg, "pretraining_tp", 1) > 1:
+            outs = attn_output.split((hd * nh) // cfg.pretraining_tp, dim=2)
+            weights = attn.o_proj.weight.split((hd * nh) // cfg.pretraining_tp, dim=1)
+            attn_output = sum(F.linear(x, w) for x, w in zip(outs, weights))
+        else:
+            attn_output = attn.o_proj(attn_output)
+        return attn_output, None
 
     # ------------------------------------------------------------------ #
     # Step
@@ -477,6 +792,14 @@ class BatchInferState:
         # Mark before the first call so the failed step can release them all.
         self._decode_handlers_armed = True
         for i in self.active_indices:
+            # Per-slot _prepare_decode also begins that slot's own decode
+            # handler (infer_state._prepare_decode -> decode_handler_tab[b].
+            # begin_forward).  That begin_forward is redundant for THIS batch's
+            # attention, which uses the shared self._handler instead.  It is kept
+            # because the same InferState._prepare_decode/_finish_decode pair is
+            # the serial decode path (decode_sdpa reads decode_handler_tab[
+            # kvc.budget]); removing it here would break serial decode and
+            # unbalance begin/end_forward.  See P0-3 in BATCH_CODE_FLOW.md.
             self.states[i]._prepare_decode(1)
 
     def _cleanup_decode_handlers(self):
@@ -609,14 +932,23 @@ class BatchInferState:
     # Request exit / reuse (explicit; not a scheduler)
     # ------------------------------------------------------------------ #
     def retire(self, index):
-        """Release slot ``index`` and free the request's GPU pages.
+        """Release slot ``index``, free its shared GPU pages, and return the state.
 
         Rejects if the batch is closed/failed, a step or query is in flight, or
-        the slot is already free.  GPU pages owned by the request (across all
-        layers) are deduplicated and returned to the shared pool; a page already
-        marked free raises instead of allowing a double free.  CPU KvCache and
-        DCI index are owned by the caller and are reclaimed when the caller
-        releases the request object -- we only drop this batch's reference here.
+        the slot is already free.
+
+        Only the *shared* resource can be handed back here: the request's pages in
+        the batch's GPU ``KvPool`` are deduplicated and returned to it, and a page
+        already marked free raises instead of allowing a double free.  Everything
+        else on an ``InferState`` is private to that request -- its CPU ``KvPool``
+        is built inside ``InferState.__init__`` (``infer_state.py``), the DCI index
+        has no destroy entry point, and the transit buffers belong to it as well --
+        so those are freed only when the last reference dies.  This method drops
+        the batch's own references and **returns the state**; callers wanting
+        deterministic reclamation should drop the returned object (the probe does).
+        It also calls the request's ``InferState.shutdown()``, stopping the
+        background asyncio loop and worker executor that the async offload path
+        would otherwise leak across admit/retire cycles.
         """
         if self._closed:
             raise RuntimeError("cannot retire from a closed batch")
@@ -624,6 +956,8 @@ class BatchInferState:
             raise RuntimeError("batch forward failed; create fresh request states")
         if self._step_active:
             raise RuntimeError("cannot retire a slot while a decode step is active")
+        if self._forward_lock.locked():
+            raise RuntimeError("cannot retire a slot while a batch forward is in flight")
         if self._query_active:
             raise RuntimeError("cannot retire a slot while a batch query is active")
         if not 0 <= index < self.capacity:
@@ -637,6 +971,14 @@ class BatchInferState:
         # write, so drain the device before freeing.  retire is rare, which makes
         # a full synchronize the cheapest correct barrier here.
         torch.cuda.synchronize()
+        # Stop the request's background asyncio loop and its worker executor
+        # before anything is torn down: nothing else ever does, so leaving it
+        # running would accumulate one thread plus one executor per retire/admit
+        # cycle.  Doing it first also means a refusal (still-pending offload
+        # future) leaves this slot completely intact.
+        shutdown = getattr(state, "shutdown", None)
+        if shutdown is not None:
+            shutdown()
         freed = set()
         for layer in range(self.n_layers):
             cache = state.kv_caches[layer]
@@ -652,12 +994,43 @@ class BatchInferState:
                     raise RuntimeError(
                         f"physical GPU page {page} is already free; double free prevented")
                 self._pool.free_page(page)
-        # Drop the reference; the request's CPU/DCI resources become unreferenced
-        # and are reclaimed by the caller/GC.  We do not deep-copy or actively
-        # free them here.
+        # Drop the batch's references to the request's private resources, then
+        # clear the slot.  The caller still holds the state object, which is why
+        # it is returned -- dropping that reference is what actually frees the
+        # CPU KV pool and the DCI trees.
+        self._release_request_resources(state)
         self.states[index] = None
         self.query_counts[index] = 0
         self.query_counts_by_layer[index] = [0] * self.n_layers
+        return state
+
+    def _release_request_resources(self, state):
+        """Drop the batch's references to a retired request's private resources.
+
+        Every heavy allocation on an ``InferState`` is per-request, so there is no
+        shared pool to return them to: ``_cpu_pool`` is constructed inside
+        ``InferState.__init__`` (``infer_state.py``), the ``cpu_kv_caches`` and the
+        offload/transit buffers hang off that pool, and the DCI index (``dci_db``)
+        exposes no destroy call.  Clearing these fields means the memory -- notably
+        the pinned CPU KV pool, hundreds of MB at the default page count -- is
+        released as soon as the caller drops the returned state.  The retired state
+        is not usable afterwards, which is the documented contract.
+        """
+        def _drop(attr):
+            if getattr(state, attr, None) is not None:
+                setattr(state, attr, None)
+
+        # CPU caches first (they reference the pool), then the pool itself.
+        for attr in ("cpu_kv_caches", "temp_cpu_kv_caches", "cpu_neighbour_caches",
+                     "offload_win_caches"):
+            if getattr(state, attr, None) is not None:
+                setattr(state, attr, [None] * self.n_layers)
+        for attr in ("_page_log", "cpu_transit_buffer", "cuda_transit_buffer",
+                     "cuda_cast_buffer", "_src_address_buffer", "dci_db", "_cpu_pool",
+                     # Holds raw pointers into _cpu_pool; drop it so the retired
+                     # state carries no dangling addresses.
+                     "page_address_buffer"):
+            _drop(attr)
 
     def admit(self, index, state):
         """Place a freshly prefilled ``state`` into the free slot ``index``.
@@ -674,6 +1047,8 @@ class BatchInferState:
             raise RuntimeError("batch forward failed; create fresh request states")
         if self._step_active:
             raise RuntimeError("cannot admit a slot while a decode step is active")
+        if self._forward_lock.locked():
+            raise RuntimeError("cannot admit a slot while a batch forward is in flight")
         if self._query_active:
             raise RuntimeError("cannot admit a slot while a batch query is active")
         if not 0 <= index < self.capacity:
@@ -703,3 +1078,5 @@ class BatchInferState:
         self.states[index] = state
         self.query_counts[index] = 0
         self.query_counts_by_layer[index] = [0] * self.n_layers
+        # The active set just grew; make sure the shared workspace covers it.
+        self._ensure_workspace(self.batch_size)

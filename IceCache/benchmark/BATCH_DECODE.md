@@ -22,11 +22,12 @@ call per layer. No CUDA kernel was changed.
   carries its own request length) plus a length-1 `cache_position`. It binds and
   restores the model state automatically. The caller does not pass a
   Transformers KV cache; `use_cache` is fixed to false.
-- `batch.retire(index)` frees that slot's GPU pages back to the shared pool and
-  marks the slot free; `batch.admit(index, state)` places a freshly prefilled
-  request into a free slot after checking pool identity, page disjointness and
-  configuration. `batch.active_indices` lists the live slots and
-  `batch.batch_size` is their count.
+- `batch.retire(index)` frees that slot's pages in the shared GPU pool and
+  **returns** the retired state; `batch.admit(index, state)` places a freshly
+  prefilled request into a free slot after checking pool identity, page
+  disjointness and configuration. `batch.active_indices` lists the live slots and
+  `batch.batch_size` is their count. See "Resource ownership on retire" below for
+  what retire can and cannot reclaim.
 - `batch.build_attention_metadata(layer_idx)` returns the CSR `indices`,
   `indptr`, `last_page_len` and per-page/per-head valid entries used by the
   actual batched attention call, assembled in active-slot order.
@@ -229,6 +230,201 @@ request-exit rework. It deliberately omits the CPU replay arms, so it does **not
 re-establish the A/B timing conclusion from the pre-hardening 2026-09-16 table.
 To recover an A/B comparison, rerun both arms with `--cpu-replay-repeats 20`
 (matching the historical launcher).
+
+## Batched prefill (one forward, per-request trees)
+
+New on branch `batch` (2026-09-17). A batched prefill runs B prompts through a
+single `model(...)` call, then builds each request's DCI tree independently. The
+decode path, the KV-allocation strategy and the `b == 0` semantics of every
+`InferState` are unchanged. This is the "批量 prefill、分别建树" feature.
+
+### Interface
+
+- `BatchInferState(...)` accepts a new `prefilled=False` flag
+  (`batch.py:48`). The constructor skips the per-request `_check_prefilled` guard
+  so it can be created *before* prefill; the probe's existing
+  `from_prefilled(...)` keeps `prefilled=True` (default) for the serial path
+  (`batch.py:186`).
+- `batch.prefill_batch(model, prompts)`
+  (`batch.py:193`) performs the batched prefill:
+  - `prompts`: list of 1-D `LongTensor` token ids, one per active slot in
+    `active_indices` order.
+  - Pads to a dense `[B, Lmax]` `input_ids` / `position_ids` (each row's real
+    positions are `0..L_i-1`; padding rows are zero). One `model(...)`.
+  - Returns `(logits, next_tokens)` with `logits` shape `[B, Lmax, vocab]` (the
+    patched LM head is temporarily un-truncated so every request's last real
+    token is readable) and `next_tokens[i] = argmax(logits[i, L_i-1])`.
+- `ForwardMode.BATCH_PREFILL` (`infer_state.py:48`) is the new mode.
+  `_icecache_attn_forward` (`adapter/modeling.py:478`) routes a `BatchInferState`
+  whose `forward_mode` is `BATCH_PREFILL` to
+  `BatchInferState.prefill_attention_forward` (`adapter/modeling.py:492-493`);
+  every other `BatchInferState` still goes to the decode `attention_forward`, so
+  the batch path can never accidentally take the decode branch.
+
+### How padding is excluded
+
+Inside `prefill_attention_forward` (`batch.py:278`, one call per layer, mirroring
+`_icecache_prefill`):
+
+- **KV write** (`batch.py`): for each active request `i` only its first `L_i`
+  real tokens are sliced from the padded q/k/v and passed to that request's own
+  `kv_caches[layer].prefill_alloc_n_tokens(L_i, ...)`
+  (`infer_state.py:308`, still `bsz=1`) and `append_paged_kv_cache`
+  (`infer_state.py:1355`). Padding positions never reach a `KvCache`.
+- **Prefill attention** (`batch.py:385`): a single
+  `BatchPrefillWithPagedKVCacheWrapper` call over the *flattened real tokens* of
+  all requests, keyed by the per-request real-length CSR —
+  `qo_indptr = cumsum([0, L_0, L_0+L_1, ...])` and
+  `paged_kv_indptr = cumsum([0, n_pages_0, ...])`. Padding tokens are absent from
+  `qo_indptr`, so they are neither queries nor attended-to keys. This is exactly
+  the ragged batch-prefill pattern (vLLM V1 `query_start_loc` / `InputBatch`,
+  SGLang `extend`).
+- **Tree building** (`infer_state.py`): `prefill_evict_extra_pages`
+  (`infer_state.py:1544`) -> `_DCI_first_call` (`infer_state.py:914`) runs
+  **per request** on that request's real tokens. The query passed is that
+  request's last real token, `query_states[pos:pos+1, -1:, :, :]` — dim 1 is the
+  token axis in this layout. The `b == 0` argument used throughout `KvCache` /
+  `_DCI_*` is untouched — each member is still an `InferState` with
+  `batch_size == 1`.
+- **Tensor layout must match the serial `_icecache_prefill` exactly.** After
+  `apply_rotary_pos_emb` the tensors are `[B, heads, Lmax, hd]`; query/key are
+  transposed to token-major `[B, Lmax, heads, hd]`, and **value must stay**
+  `[B, Lmax, nkv, hd]` (its projection already produced that layout). Two failure
+  modes were hit while bringing this up, both fixed: transposing value as well
+  yields a strided `[B, nkv, Lmax, hd]` slice that `append_paged_kv_cache_prefill`
+  rejects with `v must be contiguous`; and slicing the padded grid as
+  `t[pos, :, :L_i]` truncates the *head* axis instead of the token axis, so
+  `Lmax` tokens get written into an `L_i`-token cache (use `t[pos, :L_i]`).
+
+### Page allocation
+
+`prefill_alloc_n_tokens` still requires one contiguous page run per layer and a
+prefill keeps every prompt page resident, so the peak GPU footprint during the
+single batched forward is `n_layers * sum(ceil(L_i / page_size))` — identical to
+the serial path, which simply reaches the same peak one prompt at a time. No new
+discontiguous allocation is introduced. The probe already auto-sizes the pool
+from the summed prompt lengths, so all B prompts fit simultaneously.
+
+### Difference from the serial path
+
+- Serial: one `model(...)` per request, each bound via `icecache_state`; trees
+  built as a side effect of each forward. Decode then runs over the already
+  prefilled batch.
+- Batched: one `model(...)` for all B; the projection/MLP and attention-proj are
+  vectorized over the padded `[B, Lmax]` grid, but the KV write, the (single
+  ragged) attention CSR and the tree build remain per request. Padding rows cost
+  wasted projection/MLP FLOPs but never enter attention or the caches.
+- The probe records `prefill_mode` (`sequential`/`batched`) and `prefill_seconds`
+  (a single batched-forward duration in batched mode) in the result JSON. Default
+  is `sequential` — the serial path is unchanged.
+
+### Usage
+
+```
+benchmark/batch_decode_probe.py --prefill-mode batched --batch-size 2 \
+  --query-backend native --output <path>
+```
+
+### P0-3 status (per-slot decode handler begin_forward)
+
+The batch decode path uses `self._handler` (`batch.py`), not the per-slot
+`decode_handler_tab`. `BatchInferState._prepare_decode` still calls each slot's
+`state._prepare_decode(1)`, which also begins that slot's own decode handler in
+`infer_state.py`. The begin_forward there is redundant for the *batch compute*
+path, but it is **not removed**: that same `InferState._prepare_decode` /
+`_finish_decode` pair is the serial decode path (`decode_sdpa` reads
+`decode_handler_tab[kvc.budget]`), and removing the begin_forward would break
+serial decode and unbalance `begin`/`end_forward`. It is kept and annotated in
+`batch.py`.
+
+
+### Resource ownership on retire
+
+`retire` can only hand back what is **shared**:
+
+- **Shared, reclaimed here:** the request's pages in the batch's GPU `KvPool`
+  (the `c2p` union across layers, deduplicated, with a double-free guard). A
+  `--batch-size 2` run reports `retire_gpu_pages_returned = 512` — 16 resident
+  pages x 32 layers, i.e. exactly that request's resident pages.
+- **Per-request, but the batch still stops what it can:** the CPU `KvPool` is
+  built inside `InferState.__init__` (`infer_state.py`), so there is no shared
+  pool to return it to, and the DCI index exposes no destroy entry point.
+  The background asyncio loop and its worker executor, however, *are* stopped:
+  `retire` calls `InferState.shutdown()`, which shuts the executor down and stops
+  the loop (the daemon thread then closes it and exits). Without that, every
+  admit/retire cycle would strand one thread plus one executor. For the rest,
+  `retire` clears the batch's and the state's own references
+  (`_release_request_resources`, which also drops the raw `page_address_buffer`
+  pointers into the CPU pool) and **returns the state** — dropping that last
+  reference is what frees the CPU KV pool (hundreds of MB at the default page
+  count) and the trees. The probe does exactly that (`del retired_state` +
+  `gc.collect()`) and reports `retire_gpu_pages_returned`, `loop_stopped` and the
+  thread-count delta, so the reclaim is observable.
+
+So the exit path is closed for the shared GPU pages and for the per-request
+threads/executor, and is *reference-driven* for the CPU KV pool and the DCI trees.
+A library-grade version would add an explicit `release()` on `InferState` plus a
+DCI destroy call; neither exists today, which is a documented limitation rather
+than a hidden leak.
+
+### Workspace sizing
+
+The decode and prefill wrappers share one FlashInfer scratch buffer, mirroring the
+serial path (which hands one 16 MiB buffer per budget group to both that group's
+prefill *and* decode wrappers). The batch sizes it as `16 MiB x live rows`, grows
+it when the batch grows (`_ensure_workspace`, called from `__init__`,
+`prefill_batch` and `admit`) and re-points both wrappers through
+`reset_workspace_buffer`. Observed values: 32 MiB at B=2, 64 MiB at B=4.
+`ICECACHE_BATCH_WORKSPACE_MB` overrides the size outright; the true requirement
+for large B is not characterised, and a warning fires above 1 GiB.
+
+### Verification (2026-09-17)
+
+**Equivalence with the serial prefill.** Two runs with identical arguments
+(`--batch-size 2`, serial DCI backend, `--steps 8 --extra-steps 4
+--post-admit-steps 4`, same seeds, greedy decode) that differ *only* in
+`--prefill-mode` produced identical results:
+
+| Field | sequential | batched |
+|---|---|---|
+| `generated_token_ids` | — | **identical** (20 tokens: 4 + 16) |
+| `native_points_before` / `after` | — | **identical** |
+| `decode_steps` | 12 | 12 |
+| `query_counts_by_layer` | — | **identical** |
+| `prefill_seconds` | 0.661 + 0.439 = 1.100 s | 1.048 s (one forward) |
+
+So the single batched forward leaves the same per-request KV and the same DCI
+trees as prefilling the prompts one at a time, and the decode that follows is
+unaffected. The wall-time figures are single observations on a shared GPU and are
+not a throughput claim: the padded `[2, 1040]` grid performs 2x1040 rows of
+projection/MLP work, so no scaling conclusion is drawn either way.
+
+**B = 3.** `--batch-size 3 --prefill-mode batched` also passed (prompt lengths
+1024 / 1040 / 1056, one prefill forward, `auto gpu_pages = 8192`): a single
+`model(...)` for all three prompts, then `retire(0)` leaving the **non-contiguous**
+active set `[1, 2]`, four steps at B=2, `admit(0)` of a 960-token request, four
+steps at B=3. `decode_steps = 12` and the per-slot token counts `[4, 12, 12]`
+matched the assertions exactly, which also exercises the row-order = active-request
+(not slot index) invariant at B=3.
+
+**Unchanged behaviour.** The `--prefill-mode sequential` B=2 variable-length run
+(48+24+8 decode steps, native backend, `raw_equal_elements = 3072`) is untouched
+by this work; the batched path is opt-in and defaults off.
+
+**Re-checked after the resource/workspace work.** `sequential` and `batched` runs
+at `--batch-size 2` (4+4+4 steps) both exit 0, report the same `workspace_bytes`
+(32 MiB) and the same `retire_gpu_pages_returned` (512), and produce **identical**
+`generated_token_ids`. A `--batch-size 4 --prefill-mode batched` run also passed:
+64 MiB workspace, 512 pages returned, `decode_steps = 12`, per-slot token counts
+`[4, 12, 12, 12]`.
+
+**Thread release on retire.** With `InferState.shutdown()` wired into `retire`,
+the same runs report `loop_stopped=True` and the process thread count drops by 2
+at the retire (B=2: 6 -> 4; B=4: 10 -> 8) — the asyncio loop thread and its
+executor worker. Repeated admit/retire cycles therefore no longer accumulate
+threads, which was the last item of the exit path that could be closed without
+upstream changes.
+
 
 ## Files
 

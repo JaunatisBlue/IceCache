@@ -43,6 +43,9 @@ class ForwardMode(Enum):
     INITIAL_PREFILL = "initial_prefill"
     CONTINUATION_PREFILL = "continuation_prefill"
     DECODE = "decode"
+    # Batched prefill: one model forward over B padded prompts, trees built
+    # per request afterwards.  Dispatched in adapter/modeling._icecache_attn_forward.
+    BATCH_PREFILL = "batch_prefill"
 
 
 class InferState:
@@ -246,7 +249,12 @@ class InferState:
 
         def _start_loop(loop):
             asyncio.set_event_loop(loop)
-            loop.run_forever()
+            try:
+                loop.run_forever()
+            finally:
+                # shutdown() stops the loop; close it here so the thread does not
+                # leave its selector and self-pipe behind.
+                loop.close()
 
         Thread(target=_start_loop, args=(self._loop,), daemon=True).start()
 
@@ -278,6 +286,28 @@ class InferState:
             n_groups = n_kv_heads // group_size
         self.group_size = group_size
         self.n_groups = n_groups
+
+    def shutdown(self):
+        """Stop this request's background asyncio loop and its worker executor.
+
+        ``InferState`` starts one daemon thread running an asyncio loop plus a
+        single-worker ``ThreadPoolExecutor`` to drive the asynchronous offload
+        path, and nothing else ever stops them.  A long-running batch that admits
+        and retires requests would therefore accumulate one thread and one
+        executor per request; call this when a request leaves the batch
+        (``BatchInferState.retire`` does).  It is idempotent, and it refuses to run
+        while an offload future is still pending so a caller cannot pull the loop
+        out from under in-flight work.
+        """
+        if self._dci_future is not None:
+            raise RuntimeError(
+                "cannot shut down an InferState with an in-flight offload future")
+        executor, self._loop_executor = self._loop_executor, None
+        if executor is not None:
+            executor.shutdown(wait=False)
+        loop, self._loop = self._loop, None
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
 
     @property
     def seq_len(self):

@@ -144,6 +144,9 @@ def main():
     parser.add_argument("--cpu-pages-per-request", type=int, default=4096)
     parser.add_argument("--query-backend", choices=("serial", "native"), default="serial")
     parser.add_argument("--query-threads", type=int, default=16)
+    parser.add_argument("--prefill-mode", choices=("sequential", "batched"), default="sequential",
+                        help="sequential = per-request model(...) prefill (default, unchanged); "
+                             "batched = one padded model(...) forward over all B prompts, trees built per request")
     parser.add_argument("--compare-native-raw", action="store_true")
     parser.add_argument("--cpu-replay-repeats", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
@@ -223,28 +226,57 @@ def main():
     # DCI mutates cache tensors across those threads; no_grad avoids creating
     # inference tensors that reject such updates outside the main thread.
     with torch.no_grad():
-        for i, state in enumerate(states):
-            # Distinct prompt length per request (still above the GPU budget).
-            length_i = prompt_len(i)
-            ids = make_prompt(tokenizer, length_i, 101 + i, device)
-            prompts.append(ids)
-            prompt_lens.append(length_i)
-            state.forward_mode = ForwardMode.INITIAL_PREFILL
-            start = time.perf_counter()
-            try:
-                with icecache_state(model, state):
-                    out = model(input_ids=ids,
-                                position_ids=torch.arange(ids.shape[1], device=device)[None],
-                                cache_position=torch.arange(ids.shape[1], device=device),
-                                use_cache=False, return_dict=True)
-            finally:
-                state.forward_mode = None
+        if args.prefill_mode == "batched":
+            # One padded model(...) forward over all B prompts.  Each member is
+            # prefilled independently (its own KvCache / DCI tree); only the
+            # FlashInfer prefill attention is batched.  pad positions are
+            # excluded from KV write, attention and tree building.
+            batch = BatchInferState(
+                states, query_backend=args.query_backend,
+                query_threads=args.query_threads, prefilled=False)
+            # Prompts are consumed in ``active_indices`` order.  Nothing has been
+            # retired yet, so active order == slot order, and ``prompt_lens`` is
+            # appended in the same order so it stays slot-indexed.  ``make_prompt``
+            # returns [1, L] while ``prefill_batch`` takes 1-D token ids.
+            for slot in batch.active_indices:
+                length_slot = prompt_len(slot)
+                prompts.append(make_prompt(tokenizer, length_slot, 101 + slot, device)[0])
+                prompt_lens.append(length_slot)
             torch.cuda.synchronize()
-            prefill_seconds.append(time.perf_counter() - start)
-            tokens.append(out.logits[:, -1].argmax(dim=-1))
-            if not state.use_dci or any(db is None for db in state.dci_db):
-                raise AssertionError(f"request {i} did not build every DCI tree")
-            print(f"prefill request={i} tokens={ids.shape[1]} seconds={prefill_seconds[-1]:.3f}", flush=True)
+            start = time.perf_counter()
+            out, next_tokens = batch.prefill_batch(model, prompts)
+            torch.cuda.synchronize()
+            prefill_seconds = [time.perf_counter() - start]
+            tokens = list(next_tokens)
+            for slot in batch.active_indices:
+                # A prompt within the page budget legitimately stays non-sparse.
+                if states[slot].use_dci and any(db is None for db in states[slot].dci_db):
+                    raise AssertionError(f"request {slot} did not build every DCI tree")
+                print(f"batched prefill slot={slot} tokens={prompt_lens[slot]} "
+                      f"seconds={prefill_seconds[-1]:.3f}", flush=True)
+        else:
+            # Distinct prompt length per request (still above the GPU budget).
+            for i, state in enumerate(states):
+                length_i = prompt_len(i)
+                ids = make_prompt(tokenizer, length_i, 101 + i, device)
+                prompts.append(ids)
+                prompt_lens.append(length_i)
+                state.forward_mode = ForwardMode.INITIAL_PREFILL
+                start = time.perf_counter()
+                try:
+                    with icecache_state(model, state):
+                        out = model(input_ids=ids,
+                                    position_ids=torch.arange(ids.shape[1], device=device)[None],
+                                    cache_position=torch.arange(ids.shape[1], device=device),
+                                    use_cache=False, return_dict=True)
+                finally:
+                    state.forward_mode = None
+                torch.cuda.synchronize()
+                prefill_seconds.append(time.perf_counter() - start)
+                tokens.append(out.logits[:, -1].argmax(dim=-1))
+                if not state.use_dci or any(db is None for db in state.dci_db):
+                    raise AssertionError(f"request {i} did not build every DCI tree")
+                print(f"prefill request={i} tokens={ids.shape[1]} seconds={prefill_seconds[-1]:.3f}", flush=True)
 
         # No two active requests may own the same physical GPU page.
         seen_pages = set()
@@ -260,9 +292,10 @@ def main():
             if args.compare_native_raw else (None, None)
         )
 
-        batch = BatchInferState.from_prefilled(
-            states, query_backend=args.query_backend,
-            query_threads=args.query_threads)
+        if args.prefill_mode != "batched":
+            batch = BatchInferState.from_prefilled(
+                states, query_backend=args.query_backend,
+                query_threads=args.query_threads)
         batch.validate_ready()
         before_points = [native_points(state) for state in states]
         generated_ids = [[] for _ in range(n)]
@@ -276,6 +309,7 @@ def main():
         retire_idx = 0 if n >= 2 else None
         admitted_index = None
         admitted_prompt_len = None
+        retired_free_gain = None
         post_retire_steps = args.extra_steps if retire_idx is not None else 0
 
         def run_steps(count, phase, bucket):
@@ -304,8 +338,22 @@ def main():
 
             if retire_idx is not None:
                 # ---- Request exit: free the slot's GPU pages, keep decoding ---
-                batch.retire(retire_idx)
-                print(f"retired slot={retire_idx} active={batch.active_indices}", flush=True)
+                free_before = len(batch._pool._free_ids)
+                import threading as _th
+                threads_before = _th.active_count()
+                retired_state = batch.retire(retire_idx)
+                # retire() shuts the request's asyncio loop down; grab that before
+                # we drop our reference to the state.
+                loop_stopped = getattr(retired_state, "_loop", None) is None
+                states[retire_idx] = None
+                del retired_state
+                import gc as _gc
+                _gc.collect()
+                retired_free_gain = len(batch._pool._free_ids) - free_before
+                print(f"retired slot={retire_idx} active={batch.active_indices} "
+                      f"gpu_pages_returned={retired_free_gain} "
+                      f"loop_stopped={loop_stopped} "
+                      f"threads {threads_before}->{_th.active_count()}", flush=True)
                 run_steps(post_retire_steps, "post-retire", retire_step_ms)
 
                 # ---- Request reuse: prefill a fresh request, admit it ---------
@@ -337,6 +385,10 @@ def main():
             batch.close()
 
     post_admit_steps = args.post_admit_steps if admitted_index is not None else 0
+    if any(state is None for state in states):
+        raise AssertionError(
+            "a retired slot was never re-admitted; the per-request final checks "
+            "below need every slot populated")
     after_points = [native_points(state) for state in states]
     if any(batch.query_counts[i] == 0 for i in batch.active_indices):
         raise AssertionError(f"every active request must query DCI: {batch.native_query_counts}")
@@ -369,6 +421,7 @@ def main():
     summary = {
         "config": vars(args) | {"output": str(args.output)},
         "prefill_seconds": prefill_seconds,
+        "prefill_mode": args.prefill_mode,
         "runtime": {
             "torch": torch.__version__,
             "dci_path": str(dci_path),
@@ -380,6 +433,8 @@ def main():
         "native_query_counts": batch.native_query_counts,
         "query_counts_by_layer": batch.query_counts_by_layer,
         "query_backend": batch.query_backend,
+        "workspace_bytes": batch.workspace_bytes,
+        "retire_gpu_pages_returned": retired_free_gain,
         "native_scheduler": batch._native.last_query_stats()
             if args.query_backend == "native" else None,
         "raw_equal_elements": raw_equal_elements,
