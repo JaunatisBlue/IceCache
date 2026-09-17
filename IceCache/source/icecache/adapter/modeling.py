@@ -486,6 +486,10 @@ def _icecache_attn_forward(
     debug: bool = False,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    from icecache.batch import BatchInferState
+    if isinstance(infer_state, BatchInferState):
+        return infer_state.attention_forward(
+            self, hidden_states, position_embeddings, output_attentions)
     _, q_len, _ = hidden_states.size()
     mode = getattr(infer_state, "forward_mode", None)
 
@@ -562,14 +566,16 @@ def enable_icecache(
         _lm_head_forward = self.lm_head.forward
         self.lm_head.forward = lambda x: _lm_head_forward(x[:, -1:, :])
 
+    self._icecache_infer_state = infer_state
     for mod in self.modules():
         mod_cls = str(mod.__class__)
         if "Attention" in mod_cls:
             mod.forward = (
-                lambda mod: lambda *args, **kwargs: _icecache_attn_forward(
-                    mod, *args, infer_state=infer_state, debug=debug, **kwargs
+                lambda mod, model: lambda *args, **kwargs: _icecache_attn_forward(
+                    mod, *args, infer_state=model._icecache_infer_state,
+                    debug=debug, **kwargs
                 )
-            )(mod)
+            )(mod, self)
 
     # Expose the state so a caller (e.g. an agent session driving continuation)
     # can read seq_len / dci_db without going through the attention closure.
@@ -577,3 +583,10 @@ def enable_icecache(
     self._icecache_infer_state = infer_state
 
     return self
+
+
+def set_icecache_infer_state(model: LlamaForCausalLM, infer_state):
+    """Select a prefill request state or a fixed decode batch without repatching."""
+    if not hasattr(model, "_icecache_infer_state"):
+        raise ValueError("call enable_icecache(model, ...) first")
+    model._icecache_infer_state = infer_state

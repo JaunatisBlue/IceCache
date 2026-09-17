@@ -72,6 +72,7 @@ class InferState:
         debug=False,
         ratio_1=0.01,
         ratio_2=0.2,
+        gpu_pool=None,
         **kwargs,
     ) -> None:
         self.n_layers = n_layers
@@ -152,8 +153,15 @@ class InferState:
         self._ci32 = dict(dtype=torch.int32, device=torch.device("cpu"))
         self._cb = dict(dtype=torch.bool, device=torch.device("cpu"))
 
-        self._pool = KvPool(n_max_pages, page_size, n_kv_heads,
-                            head_dim, dtype, device, (0, 2, 1, 3))
+        self._owns_gpu_pool = gpu_pool is None
+        self._pool = gpu_pool if gpu_pool is not None else KvPool(
+            n_max_pages, page_size, n_kv_heads, head_dim, dtype, device,
+            (0, 2, 1, 3))
+        if (self._pool.page_size != page_size or
+                self._pool.n_kv_heads != n_kv_heads or
+                self._pool.head_dim != head_dim or
+                self._pool.dtype != dtype or self._pool.device != device):
+            raise ValueError("shared GPU KV pool configuration does not match InferState")
         self.kv_caches: List[KvCache] = [None] * self.n_layers
         self.dci_db = [None] * self.n_layers
         self._cpu_pool = KvPool(
@@ -294,6 +302,8 @@ class InferState:
             return cur_id-position_in_cycle
 
     def _prepare_prefill(self, bsz, q_len):
+        if not self._owns_gpu_pool and any(cache is not None for cache in self.kv_caches):
+            raise RuntimeError("shared-pool request states support one initial prefill; create a fresh state")
         self.num_offload_pages = None
         self.n_dci_pages = None
         self.offload_win_flag = [False] * self.n_layers
@@ -332,7 +342,10 @@ class InferState:
         self.prev_selected = None
         self.page_valid_entries = [None] * self.n_layers
         self.attn_layers = [None] * self.n_layers
-        self._pool.clear()
+        # A shared pool may already contain another request's prefilled KV.
+        # Its owner, not an individual request, controls global clearing.
+        if self._owns_gpu_pool:
+            self._pool.clear()
         self.kv_caches = [
             KvCache(
                 self._pool,
@@ -1152,7 +1165,7 @@ class InferState:
                 DCI.reuse_update_node(old_index=old_index, old_offset=old_offset, new_index=new_index, new_offset=new_offset, keys=_key_states, values=_value_states, new_address=self.page_address_buffer[cur_id][0], kv_offset=self.n_kv_heads*self.page_size*self.head_dim, ccc=reuse_ccc, num_leaves=dci_db.num_leaves)
 
 
-    def _DCI_query(self, b, cur_id, query_states):
+    def _DCI_query(self, b, cur_id, query_states, nn_idx_override=None):
         if self.use_dci:
 
             bsz = 1
@@ -1176,17 +1189,22 @@ class InferState:
 
             assert (_query.flags['C_CONTIGUOUS'])
 
-            nn_idx, _ = self.dci_db[cur_id].query(_query,
-                                                padding_mask,
-                                                num_neighbours=num_neighbours,
-                                                field_of_view=query_field_of_view,
-                                                num_to_visit=num_to_visit,
-                                                num_to_retrieve=num_to_retrieve,
-                                                prop_to_visit=prop_to_visit,
-                                                prop_to_retrieve=query_prop_to_retrieve,
-                                                parallel_level=self.parallel_level,
-                                                ratio=self.ratio,
-                                            )
+            if nn_idx_override is None:
+                nn_idx, _ = self.dci_db[cur_id].query(_query,
+                                                    padding_mask,
+                                                    num_neighbours=num_neighbours,
+                                                    field_of_view=query_field_of_view,
+                                                    num_to_visit=num_to_visit,
+                                                    num_to_retrieve=num_to_retrieve,
+                                                    prop_to_visit=prop_to_visit,
+                                                    prop_to_retrieve=query_prop_to_retrieve,
+                                                    parallel_level=self.parallel_level,
+                                                    ratio=self.ratio,
+                                                )
+            else:
+                nn_idx = nn_idx_override
+                if nn_idx.size != self.n_qo_heads * 2 * num_neighbours:
+                    raise ValueError("native batch DCI result has the wrong size")
 
             nn_idx = nn_idx.reshape(self.n_qo_heads, 2, -1)
             nn_idx_0 = nn_idx[:, 0, :].reshape(self.n_kv_heads, self.ratio, -1)
