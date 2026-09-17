@@ -1,8 +1,11 @@
-"""B=2 IceCache decode probe with independently prefilled requests.
+"""IceCache decode probe over an independently prefilled, variable-size batch.
 
-Run with the icecache environment and ``PYTHONPATH=IceCache/source``.  The
-probe requires a real DCI query in both rows and fails if either row lacks one.
-It measures a fixed batch, not an online scheduler or prefill throughput.
+Run with the icecache environment and ``PYTHONPATH=IceCache/source``.  The probe
+requires a real DCI query in every active row and fails if any row lacks one.  It
+measures a batch of ``--batch-size`` requests of *different* prompt lengths, runs
+``--steps`` decode steps, then demonstrates request exit/reuse (``retire`` one
+slot, ``admit`` a freshly prefilled request into it) followed by ``--extra-steps``
+more steps.  There is no online scheduler or continuous batching here.
 """
 
 from __future__ import annotations
@@ -19,8 +22,7 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from icecache.adapter import enable_icecache
-from icecache.adapter.modeling import set_icecache_infer_state
+from icecache.adapter import enable_icecache, icecache_state
 from icecache.batch import BatchInferState
 from icecache.infer_state import ForwardMode, InferState
 from icecache.kv_cache import KvPool
@@ -61,6 +63,7 @@ def compare_native_query_with_serial(states, query_threads, repeats=0, seed=919)
     rng = np.random.default_rng(seed)
     checked = 0
     replay = {"serial_ms": [], "native_ms": []}
+    n = len(states)
     for layer in (0, states[0].n_layers - 1):
         queries, capsules, neighbours, fields = [], [], [], []
         expected = []
@@ -86,7 +89,7 @@ def compare_native_query_with_serial(states, query_threads, repeats=0, seed=919)
         print(f"raw parity native layer={layer}", flush=True)
         observed = _mdci_batch.batch_query(capsules, queries, neighbours,
                                             fields, states[0].ratio, query_threads)
-        for i in range(2):
+        for i in range(n):
             actual = np.asarray(observed[i]).reshape(-1)
             if not np.array_equal(actual, expected[i]):
                 different = int(np.count_nonzero(actual != expected[i]))
@@ -128,9 +131,16 @@ def main():
     parser.add_argument("--model", default="/opt/model/LLM-Research/Meta-Llama-3.1-8B-Instruct")
     parser.add_argument("--prompt-tokens", type=int, default=1024)
     parser.add_argument("--steps", type=int, default=48)
+    parser.add_argument("--extra-steps", type=int, default=24,
+                        help="decode steps run while the retired slot stays free")
+    parser.add_argument("--post-admit-steps", type=int, default=8,
+                        help="decode steps run after a fresh request is admitted")
+    parser.add_argument("--batch-size", type=int, default=2,
+                        help="number of independent requests (any B >= 1)")
     parser.add_argument("--page-budget", type=int, default=16)
     parser.add_argument("--page-size", type=int, default=16)
-    parser.add_argument("--gpu-pages", type=int, default=4096)
+    parser.add_argument("--gpu-pages", type=int, default=0,
+                        help="GPU page pool size; 0 = size it from the prompt lengths")
     parser.add_argument("--cpu-pages-per-request", type=int, default=4096)
     parser.add_argument("--query-backend", choices=("serial", "native"), default="serial")
     parser.add_argument("--query-threads", type=int, default=16)
@@ -139,6 +149,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
     if args.prompt_tokens <= args.page_budget * args.page_size:
         raise ValueError("prompt must exceed the resident GPU page budget")
     torch.manual_seed(19)
@@ -149,12 +161,37 @@ def main():
     ).to(device).eval()
     cfg = model.config
     head_dim = cfg.head_dim or cfg.hidden_size // cfg.num_attention_heads
+    n = args.batch_size
+
+    def prompt_len(i):
+        """Distinct prompt length per request, each above the GPU page budget."""
+        return args.prompt_tokens + i * args.page_size
+
+    def pages_for(tokens):
+        return max(1, -(-tokens // args.page_size))
+
+    initial_lens = [prompt_len(i) for i in range(n)]
+    # ``prefill_alloc_n_tokens`` needs one *contiguous* run per layer, and a
+    # prefill keeps every prompt page resident, so the pool must hold
+    # n_layers * sum(pages) pages at once.  Keep the admitted request no longer
+    # than the slot it replaces: retiring a request only frees runs the size of
+    # that request, so a longer newcomer would not find a big enough run even
+    # with enough total free pages.
+    admit_len = (initial_lens[0] - 4 * args.page_size) if n >= 2 else None
+    needed_pages = cfg.num_hidden_layers * (
+        sum(pages_for(L) for L in initial_lens)
+        + (pages_for(admit_len) if admit_len is not None else 0)
+    )
+    gpu_pages = args.gpu_pages if args.gpu_pages > 0 else needed_pages + 2 * args.page_size
+    if args.gpu_pages <= 0:
+        print(f"auto gpu_pages={gpu_pages} (needed={needed_pages})", flush=True)
     gpu_pool = KvPool(
-        args.gpu_pages, args.page_size, cfg.num_key_value_heads,
+        gpu_pages, args.page_size, cfg.num_key_value_heads,
         head_dim, torch.float16, device, (0, 2, 1, 3),
     )
-    states = [
-        InferState(
+
+    def make_state():
+        return InferState(
             n_layers=cfg.num_hidden_layers,
             n_qo_heads=cfg.num_attention_heads,
             n_kv_heads=cfg.num_key_value_heads,
@@ -168,33 +205,38 @@ def main():
             n_win_pages=2,
             n_prefetch_layers=0,
             n_reuse_layers=0,
-            n_max_pages=args.gpu_pages,
+            n_max_pages=gpu_pages,
             n_max_cpu_pages=args.cpu_pages_per_request,
             gpu_pool=gpu_pool,
         )
-        for _ in range(2)
-    ]
+
+    n = args.batch_size
+    states = [make_state() for _ in range(n)]
     enable_icecache(model, dtype=torch.float16, device=device,
                     infer_state=states[0])
 
     tokens = []
     prompts = []
+    prompt_lens = []
     prefill_seconds = []
     # Query tasks run on worker threads.  InferenceMode is thread-local, while
     # DCI mutates cache tensors across those threads; no_grad avoids creating
     # inference tensors that reject such updates outside the main thread.
     with torch.no_grad():
         for i, state in enumerate(states):
-            set_icecache_infer_state(model, state)
-            ids = make_prompt(tokenizer, args.prompt_tokens, 101 + i, device)
+            # Distinct prompt length per request (still above the GPU budget).
+            length_i = prompt_len(i)
+            ids = make_prompt(tokenizer, length_i, 101 + i, device)
             prompts.append(ids)
+            prompt_lens.append(length_i)
             state.forward_mode = ForwardMode.INITIAL_PREFILL
             start = time.perf_counter()
             try:
-                out = model(input_ids=ids,
-                            position_ids=torch.arange(ids.shape[1], device=device)[None],
-                            cache_position=torch.arange(ids.shape[1], device=device),
-                            use_cache=False, return_dict=True)
+                with icecache_state(model, state):
+                    out = model(input_ids=ids,
+                                position_ids=torch.arange(ids.shape[1], device=device)[None],
+                                cache_position=torch.arange(ids.shape[1], device=device),
+                                use_cache=False, return_dict=True)
             finally:
                 state.forward_mode = None
             torch.cuda.synchronize()
@@ -204,9 +246,13 @@ def main():
                 raise AssertionError(f"request {i} did not build every DCI tree")
             print(f"prefill request={i} tokens={ids.shape[1]} seconds={prefill_seconds[-1]:.3f}", flush=True)
 
-        overlap = allocated_pages(states[0]) & allocated_pages(states[1])
-        if overlap:
-            raise AssertionError(f"requests own overlapping GPU pages: {sorted(overlap)[:8]}")
+        # No two active requests may own the same physical GPU page.
+        seen_pages = set()
+        for i, state in enumerate(states):
+            overlap = allocated_pages(state) & seen_pages
+            if overlap:
+                raise AssertionError(f"requests own overlapping GPU pages: {sorted(overlap)[:8]}")
+            seen_pages |= allocated_pages(state)
 
         raw_equal_elements, cpu_replay = (
             compare_native_query_with_serial(states, args.query_threads,
@@ -214,45 +260,108 @@ def main():
             if args.compare_native_raw else (None, None)
         )
 
-        batch = BatchInferState(states, query_backend=args.query_backend,
-                                query_threads=args.query_threads)
-        set_icecache_infer_state(model, batch)
+        batch = BatchInferState.from_prefilled(
+            states, query_backend=args.query_backend,
+            query_threads=args.query_threads)
+        batch.validate_ready()
         before_points = [native_points(state) for state in states]
+        generated_ids = [[] for _ in range(n)]
         step_ms = []
-        generated_ids = [[], []]
+        retire_step_ms = []
+        admit_step_ms = []
+        # Retire a NON-trailing slot whenever there are two, so the active set
+        # stops being 0..B-1.  That is exactly the case in which a slot index and
+        # a batch row index diverge, so this exercises the general path rather
+        # than the contiguous prefix the main loop happens to use.
+        retire_idx = 0 if n >= 2 else None
+        admitted_index = None
+        admitted_prompt_len = None
+        post_retire_steps = args.extra_steps if retire_idx is not None else 0
+
+        def run_steps(count, phase, bucket):
+            """Decode ``count`` steps over the *active* slots only.
+
+            ``tokens`` is indexed by slot; the forward consumes active slots in
+            ``batch.active_indices`` order, so rows must be mapped back by slot.
+            """
+            for step in range(count):
+                active = batch.active_indices
+                ids = torch.stack([tokens[i] for i in active], dim=0)
+                start = time.perf_counter()
+                out = batch.step(model, ids, return_dict=True)
+                torch.cuda.synchronize()
+                bucket.append(1000.0 * (time.perf_counter() - start))
+                for row, slot in enumerate(active):
+                    tokens[slot] = out.logits[row, -1].argmax(dim=-1)[None]
+                    generated_ids[slot].append(int(tokens[slot].item()))
+                if (step + 1) % 8 == 0:
+                    print(f"{phase} step={step+1}/{count} ms={bucket[-1]:.2f} "
+                          f"active={active} queries={batch.native_query_counts}", flush=True)
+
         try:
             torch.cuda.reset_peak_memory_stats(device)
-            for step in range(args.steps):
-                ids = torch.stack(tokens, dim=0)
-                pos = torch.tensor(batch.seq_lens, device=device, dtype=torch.long)[:, None]
-                start = time.perf_counter()
-                out = model(input_ids=ids, position_ids=pos,
-                            cache_position=pos[0], use_cache=False,
-                            return_dict=True)
+            run_steps(args.steps, "decode", step_ms)
+
+            if retire_idx is not None:
+                # ---- Request exit: free the slot's GPU pages, keep decoding ---
+                batch.retire(retire_idx)
+                print(f"retired slot={retire_idx} active={batch.active_indices}", flush=True)
+                run_steps(post_retire_steps, "post-retire", retire_step_ms)
+
+                # ---- Request reuse: prefill a fresh request, admit it ---------
+                new_state = make_state()
+                new_ids = make_prompt(tokenizer, admit_len, 707 + n, device)
+                new_state.forward_mode = ForwardMode.INITIAL_PREFILL
+                try:
+                    with icecache_state(model, new_state):
+                        new_out = model(input_ids=new_ids,
+                                        position_ids=torch.arange(new_ids.shape[1], device=device)[None],
+                                        cache_position=torch.arange(new_ids.shape[1], device=device),
+                                        use_cache=False, return_dict=True)
+                finally:
+                    new_state.forward_mode = None
                 torch.cuda.synchronize()
-                step_ms.append(1000.0 * (time.perf_counter() - start))
-                tokens = [out.logits[i, -1].argmax(dim=-1)[None] for i in range(2)]
-                for i in range(2):
-                    generated_ids[i].append(int(tokens[i].item()))
-                if (step + 1) % 8 == 0:
-                    print(f"decode step={step+1}/{args.steps} ms={step_ms[-1]:.2f} queries={batch.native_query_counts}", flush=True)
+                if not new_state.use_dci or any(db is None for db in new_state.dci_db):
+                    raise AssertionError("admitted request did not build every DCI tree")
+                batch.admit(retire_idx, new_state)
+                states[retire_idx] = new_state
+                prompt_lens[retire_idx] = admit_len
+                tokens[retire_idx] = new_out.logits[:, -1].argmax(dim=-1)
+                generated_ids[retire_idx] = []
+                admitted_index = retire_idx
+                admitted_prompt_len = admit_len
+                print(f"admit slot={retire_idx} admit_tokens={admit_len} "
+                      f"active={batch.active_indices}", flush=True)
+                run_steps(args.post_admit_steps, "post-admit", admit_step_ms)
         finally:
             batch.close()
 
+    post_admit_steps = args.post_admit_steps if admitted_index is not None else 0
     after_points = [native_points(state) for state in states]
-    if any(count == 0 for count in batch.native_query_counts):
-        raise AssertionError(f"both requests must query DCI: {batch.native_query_counts}")
-    for i, (before, after) in enumerate(zip(before_points, after_points)):
-        if not any(end is not None and start is not None and end > start
-                   for start, end in zip(before, after)):
-            raise AssertionError(f"request {i} did not incrementally insert into DCI")
-        if states[i].seq_len != args.prompt_tokens + args.steps:
+    if any(batch.query_counts[i] == 0 for i in batch.active_indices):
+        raise AssertionError(f"every active request must query DCI: {batch.native_query_counts}")
+    for i in range(n):
+        if i == admitted_index:
+            # The admitted request only decoded after it was admitted.
+            expected = admitted_prompt_len + post_admit_steps
+        else:
+            expected = prompt_lens[i] + args.steps + post_retire_steps + post_admit_steps
+        if states[i].seq_len != expected:
             raise AssertionError(f"request {i} has incorrect final sequence length")
-    if batch.decode_steps != args.steps:
+    if any(i != admitted_index and not any(
+            end is not None and start is not None and end > start
+            for start, end in zip(before_points[i], after_points[i]))
+           for i in range(n)):
+        raise AssertionError("an original request did not incrementally insert into DCI")
+    if batch.decode_steps != args.steps + post_retire_steps + post_admit_steps:
         raise AssertionError("batch forward count disagrees with requested steps")
-    overlap = allocated_pages(states[0]) & allocated_pages(states[1])
-    if overlap:
-        raise AssertionError(f"requests own overlapping GPU pages after decode: {sorted(overlap)[:8]}")
+    # Re-check page isolation across the (now reused) active set.
+    seen_pages = set()
+    for i, state in enumerate(states):
+        overlap = allocated_pages(state) & seen_pages
+        if overlap:
+            raise AssertionError(f"requests own overlapping GPU pages after decode: {sorted(overlap)[:8]}")
+        seen_pages |= allocated_pages(state)
 
     measured = step_ms[min(8, len(step_ms)) :]
     import dciknn._dci as installed_dci
@@ -269,6 +378,8 @@ def main():
             "native_module": getattr(getattr(batch, "_native", None), "__file__", None),
         },
         "native_query_counts": batch.native_query_counts,
+        "query_counts_by_layer": batch.query_counts_by_layer,
+        "query_backend": batch.query_backend,
         "native_scheduler": batch._native.last_query_stats()
             if args.query_backend == "native" else None,
         "raw_equal_elements": raw_equal_elements,
@@ -280,7 +391,9 @@ def main():
         "generated_token_ids": generated_ids,
         "mean_step_ms_after_warmup": sum(measured) / len(measured) if measured else None,
         "output_tokens_per_second_after_warmup":
-            2000.0 * len(measured) / sum(measured) if measured else None,
+            1000.0 * n * len(measured) / sum(measured) if measured else None,
+        "retire_step_ms": retire_step_ms,
+        "admit_step_ms": admit_step_ms,
         "batch_query_seconds": batch.batch_query_seconds,
         "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
     }

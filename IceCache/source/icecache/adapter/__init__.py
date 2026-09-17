@@ -3,7 +3,8 @@ from .generate import (
     disable_3_stages_gen,
     reset_q_input_ids,
 )
-from .modeling import enable_icecache
+from .modeling import enable_icecache, set_icecache_infer_state, icecache_state
+from ..batch import BatchInferState
 from .agent_session import (
     IceCacheAgentSession,
     PrefixMismatchError,
@@ -19,6 +20,9 @@ __all__ = [
     "disable_3_stages_gen",
     "reset_q_input_ids",
     "enable_icecache",
+    "set_icecache_infer_state",
+    "icecache_state",
+    "BatchInferState",
     "IceCacheAgentSession",
     "TokenwiseContinuationReference",
     "ChunkedContinuationPrefill",

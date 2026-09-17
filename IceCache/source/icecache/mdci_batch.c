@@ -77,7 +77,7 @@ static PyObject *batch_query(PyObject *unused, PyObject *args) {
         req[i].ratio = ratio;
         int heads = req[i].db->num_inst * ratio;
         int dim = req[i].db->dci_inst_list[0].dci_inst.dim;
-        if (heads < 1 || dim < 1 || req[i].neighbours < 1 ||
+        if (heads < 1 || dim < 1 || req[i].neighbours < 1 || req[i].field_of_view < 1 ||
             PyArray_NDIM(q) != 2 || PyArray_DIM(q, 0) != heads ||
             PyArray_DIM(q, 1) != dim) {
             PyErr_SetString(PyExc_ValueError, "invalid DCI capsule or query shape");
@@ -126,8 +126,8 @@ static PyObject *batch_query(PyObject *unused, PyObject *args) {
         cfg.num_to_retrieve = -1;
         cfg.prop_to_visit = 1.0f;
         cfg.prop_to_retrieve = 0.8f;
-        cfg.field_of_view = req[r].db->dci_inst_list[0].dci_inst.num_levels >= 2
-            ? req[r].field_of_view : -1;
+        /* Match py_dci_query: pass the caller's field_of_view at every level. */
+        cfg.field_of_view = req[r].field_of_view;
         cfg.target_level = 0;
         bool mask = true;
         int *nearest[1] = {NULL};

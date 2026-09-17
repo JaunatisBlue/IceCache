@@ -160,7 +160,8 @@ class InferState:
         if (self._pool.page_size != page_size or
                 self._pool.n_kv_heads != n_kv_heads or
                 self._pool.head_dim != head_dim or
-                self._pool.dtype != dtype or self._pool.device != device):
+                self._pool.dtype != dtype or self._pool.device != device or
+                self._pool._layout_map != (0, 2, 1, 3)):
             raise ValueError("shared GPU KV pool configuration does not match InferState")
         self.kv_caches: List[KvCache] = [None] * self.n_layers
         self.dci_db = [None] * self.n_layers
@@ -1165,7 +1166,8 @@ class InferState:
                 DCI.reuse_update_node(old_index=old_index, old_offset=old_offset, new_index=new_index, new_offset=new_offset, keys=_key_states, values=_value_states, new_address=self.page_address_buffer[cur_id][0], kv_offset=self.n_kv_heads*self.page_size*self.head_dim, ccc=reuse_ccc, num_leaves=dci_db.num_leaves)
 
 
-    def _DCI_query(self, b, cur_id, query_states, nn_idx_override=None):
+    def _DCI_query(self, b, cur_id, query_states, nn_idx_override=None,
+                   field_of_view_override=None):
         if self.use_dci:
 
             bsz = 1
@@ -1173,6 +1175,10 @@ class InferState:
             num_neighbours = self.n_dci_pages - self.layer2topk[cur_id]
             query_field_of_view = max(
                 int((self.seq_len) * self.search_ratio), 30)
+            if field_of_view_override is not None:
+                query_field_of_view = int(field_of_view_override)
+                if query_field_of_view < 1:
+                    raise ValueError("field_of_view must be positive")
             query_prop_to_retrieve = 0.8
 
             prev_num_points = self.dci_db[cur_id].num_points[0]

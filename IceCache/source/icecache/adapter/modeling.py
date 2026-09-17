@@ -3,6 +3,7 @@ from typing import List, Optional, Tuple, Union, Dict
 from collections import defaultdict
 from functools import wraps
 import asyncio
+from contextlib import contextmanager
 
 
 import torch
@@ -589,4 +590,31 @@ def set_icecache_infer_state(model: LlamaForCausalLM, infer_state):
     """Select a prefill request state or a fixed decode batch without repatching."""
     if not hasattr(model, "_icecache_infer_state"):
         raise ValueError("call enable_icecache(model, ...) first")
+    if infer_state is None or not hasattr(infer_state, "forward_mode"):
+        raise TypeError("infer_state must be an initialized IceCache state")
+    if getattr(model, "_icecache_state_scope_active", False):
+        raise RuntimeError("cannot switch IceCache state during a bound forward")
     model._icecache_infer_state = infer_state
+
+
+@contextmanager
+def icecache_state(model: LlamaForCausalLM, infer_state):
+    """Temporarily bind a request/batch state to an enabled model.
+
+    This makes state switching exception-safe for schedulers that interleave
+    requests, while retaining the lightweight patched attention functions.
+    """
+    if not hasattr(model, "_icecache_infer_state"):
+        raise ValueError("call enable_icecache(model, ...) first")
+    if infer_state is None or not hasattr(infer_state, "forward_mode"):
+        raise TypeError("infer_state must be an initialized IceCache state")
+    if getattr(model, "_icecache_state_scope_active", False):
+        raise RuntimeError("nested IceCache state bindings are not supported")
+    previous = model._icecache_infer_state
+    model._icecache_state_scope_active = True
+    model._icecache_infer_state = infer_state
+    try:
+        yield model
+    finally:
+        model._icecache_infer_state = previous
+        model._icecache_state_scope_active = False
