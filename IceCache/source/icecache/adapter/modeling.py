@@ -343,6 +343,68 @@ def _icecache_decode(
     return attn_output, attn_weights
 
 
+def icecache_continuation_layer(state, layer_idx, query_states, key_states, value_states,
+                                position_embeddings, q_len):
+    """One layer of a continuation chunk, given its projected (pre-RoPE) q/k/v.
+
+    Extracted from :func:`_icecache_continuation` so that the serial chunk path and
+    the batch mixed path share exactly one implementation.  Two copies of "how a
+    chunk enters the KV and is attended over" would drift, and the invariants here
+    are precisely the ones a drift would break:
+
+    * the DCI tree and the resident window stay disjoint (a page enters the tree
+      only as it leaves the window), and
+    * under DCI the chunk's K/V is written into the paged cache only after every
+      layer has run (``_finish_continuation_sparse``), because the chunk's own
+      pages are the new window content, not tree content.
+
+    Shapes are ``LlamaAttention``'s projection outputs with the batch dimension
+    fixed at 1:
+      ``query_states`` / ``key_states``   [1, q_len, n_heads, head_dim]  (pre-RoPE)
+      ``value_states``                    [1, q_len, n_kv_heads, head_dim]
+    Returns ``[1, q_len, n_qo_heads * head_dim]``.
+    """
+    if query_states.shape[0] != 1 or key_states.shape[0] != 1 or value_states.shape[0] != 1:
+        raise ValueError("continuation supports one request (batch_size == 1) per call")
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states = query_states.transpose(1, 2).contiguous()
+    key_states = key_states.transpose(1, 2).contiguous()
+
+    # Same order as prefill: the chunk's K/V is written first so that the paged
+    # prefill below sees it as the tail of the KV it attends over.
+    if state.use_dci:
+        # Sparse: refresh the resident semantic pages with BLOCK retrieval
+        # (policy b -- recency over the CPU page log).  The selection is
+        # query-independent, so the chunk and every decode step share the same
+        # resident set.  Then pack the resident per KV head and run one causal
+        # prefill with the KV head in the batch dimension.  The chunk's K/V is
+        # written into the paged cache after all layers.
+        eids, nr = state.retrieve_blocks(layer_idx)
+        if int(nr.sum()) > 0:
+            state.scatter_pages(layer_idx, eids, nr)
+
+        stage, indices, indptr, last_len = state._pack_resident(layer_idx, q_len)
+        state._cont_pack[layer_idx] = (stage, indices, indptr, last_len)
+        counts = state._resident_valid_counts(layer_idx)
+        per_head = counts.sum(0)
+        ps = state.page_size
+        totals = per_head + q_len
+        pages = (totals + ps - 1) // ps
+        state._cont_per_head[layer_idx] = per_head
+        state._cont_run_start[layer_idx] = torch.cumsum(pages * ps, 0) - pages * ps
+
+        state._write_chunk_into_stage(layer_idx, key_states, value_states)
+        attn_output = state.continuation_sdpa_batched(
+            layer_idx, query_states, stage, indices, indptr, last_len
+        )
+        state._cont_kv[layer_idx] = (key_states, value_states)
+    else:
+        state.append_paged_kv_cache(layer_idx, key_states, value_states)
+        attn_output = state.prefill_sdpa(layer_idx, query_states)
+    return attn_output.reshape(1, q_len, -1)
+
+
 def _icecache_continuation(
     self: LlamaAttention,
     hidden_states: torch.Tensor,
@@ -411,45 +473,12 @@ def _icecache_continuation(
         bsz, q_len, self.config.num_key_value_heads, self.head_dim
     )
 
-    kvc = state.kv_caches[cur_id]
-
-    cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-    query_states = query_states.transpose(1, 2).contiguous()
-    key_states = key_states.transpose(1, 2).contiguous()
-
-    # Same order as prefill: the chunk's K/V is written first so that the paged
-    # prefill below sees it as the tail of the KV it attends over.
-    if state.use_dci:
-        # Sparse: refresh the resident semantic pages with BLOCK retrieval
-        # (policy b -- recency over the CPU page log).  The selection is
-        # query-independent, so the chunk and every decode step share the same
-        # resident set.  Then pack the resident per KV head and run one causal
-        # prefill with the KV head in the batch dimension.  The chunk's K/V is
-        # written into the paged cache after all layers.
-        eids, nr = state.retrieve_blocks(cur_id)
-        if int(nr.sum()) > 0:
-            state.scatter_pages(cur_id, eids, nr)
-
-        stage, indices, indptr, last_len = state._pack_resident(cur_id, q_len)
-        state._cont_pack[cur_id] = (stage, indices, indptr, last_len)
-        counts = state._resident_valid_counts(cur_id)
-        per_head = counts.sum(0)
-        ps = state.page_size
-        totals = per_head + q_len
-        pages = (totals + ps - 1) // ps
-        state._cont_per_head[cur_id] = per_head
-        state._cont_run_start[cur_id] = torch.cumsum(pages * ps, 0) - pages * ps
-
-        state._write_chunk_into_stage(cur_id, key_states, value_states)
-        attn_output = state.continuation_sdpa_batched(
-            cur_id, query_states, stage, indices, indptr, last_len
-        )
-        state._cont_kv[cur_id] = (key_states, value_states)
-    else:
-        state.append_paged_kv_cache(cur_id, key_states, value_states)
-        attn_output = state.prefill_sdpa(cur_id, query_states)
-    attn_output = attn_output.reshape(bsz, q_len, -1)
+    # One implementation of the per-layer chunk body, shared with the batch mixed
+    # path (see icecache_continuation_layer).  ``state.kv_caches[cur_id]`` was
+    # fetched here by the previous revision but never used.
+    attn_output = icecache_continuation_layer(
+        state, cur_id, query_states, key_states, value_states,
+        position_embeddings, q_len)
 
     if 'llama' in self.config._name_or_path and self.config.pretraining_tp > 1:
         attn_output = attn_output.split(

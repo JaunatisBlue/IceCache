@@ -121,6 +121,16 @@ class BatchInferState:
         self.prefill_groups = 0
         self.prefill_padded_rows = 0
         self.prefill_real_rows = 0
+        # Mixed prefill/decode batching (``step_mixed``).  ``_mix_segments`` is the
+        # frozen row layout of the forward currently in flight and ``_mix_total``
+        # its flattened token count; both are None/0 outside such a forward, which
+        # is what makes ``_decode_slots`` an identity transform there.
+        self._mix_segments = None
+        self._mix_decode_slots = None
+        self._mix_total = 0
+        # Tokens already prefilled per slot, so a chunked prefill's next chunk can
+        # be checked to start exactly where the previous one ended.
+        self._prefill_progress = {}
         # Single stream for every request's recall copies in the batched decode
         # path.  Each InferState has its own c2g_stream, which would force one
         # synchronise per request per layer; sharing one stream here lets a single
@@ -173,6 +183,22 @@ class BatchInferState:
     def batch_size(self):
         """Number of currently active (non-free) request slots."""
         return len(self.active_indices)
+
+    @property
+    def _decode_slots(self):
+        """Slots the decode branch serves in the forward currently in flight.
+
+        ``batch_query``, ``decode_attention``, ``build_attention_metadata``,
+        ``_prepare_decode``, ``_cleanup_decode_handlers`` and ``_finish_decode``
+        all iterate the served slots.  In a mixed forward the requests that are
+        *prefilling* are active too, and running the decode branch over them would
+        query their DCI trees and append a decode token to their caches -- so those
+        methods read this instead.  Outside a mixed forward this is exactly
+        ``active_indices``, which is why the decode-only path is unchanged.
+        """
+        if self._mix_decode_slots is not None:
+            return self._mix_decode_slots
+        return self.active_indices
 
     @property
     def seq_lens(self):
@@ -283,6 +309,34 @@ class BatchInferState:
     # ------------------------------------------------------------------ #
     # Batched prefill: one model forward over B padded prompts
     # ------------------------------------------------------------------ #
+    def require_prefill_capacity(self, real_lens):
+        """Fail early, and with the real reason, when a prefill cannot fit.
+
+        ``prefill_alloc_n_tokens`` needs one *contiguous* run per layer, so the
+        binding constraint is the **largest free run**, not the number of free
+        pages.  Both are checked here, before the forward: a capacity problem then
+        surfaces as one clear error instead of a mid-forward RuntimeError that
+        leaves the shared FlashInfer handlers half-armed and the batch unusable.
+        """
+        if not real_lens:
+            return
+        per_layer = [max(1, -(-int(L) // self.page_size)) for L in real_lens]
+        need = self.n_layers * sum(per_layer)
+        largest = max(per_layer)
+        pool = self._pool
+        if pool.n_free_pages < need:
+            raise RuntimeError(
+                f"prefill needs {need} GPU pages ({self.n_layers} layers x "
+                f"{sum(per_layer)} pages per layer) but {pool.n_free_pages} are free; "
+                "size the pool from the prompt lengths")
+        if pool.max_contiguous_free_pages() < largest:
+            raise RuntimeError(
+                f"prefill needs a contiguous run of {largest} pages but the largest free "
+                f"run is {pool.max_contiguous_free_pages()} "
+                f"({pool.n_free_pages} pages free in total, "
+                f"{pool.n_alloc_run_failures} run failures so far): the GPU page pool is "
+                "fragmented")
+
     def _plan_prefill_groups(self, real_lens, token_budget):
         """Partition active rows into groups of similar length.
 
@@ -338,6 +392,7 @@ class BatchInferState:
         real_lens = [int(p.shape[0]) for p in prompts]
         if any(L < 2 for L in real_lens):
             raise ValueError("batched prefill requires q_len > 1 for every request")
+        self.require_prefill_capacity(real_lens)
         Bnum = len(active)
         device = self.device
 
@@ -590,7 +645,15 @@ class BatchInferState:
 
             # Ragged-attention metadata for this request.
             kvc = state.kv_caches[layer_idx]
-            n_pages = int(kvc.n_real_pages)
+            # ``n_pages`` (derived from seq_len) is the *written* prefix, which is
+            # what the attention may read.  ``n_real_pages`` is how many pages the
+            # cache owns, and the two differ exactly when the run was reserved for
+            # a whole prompt up front and only the first chunk has been written --
+            # the case chunked prefill creates.  They are identical today, because
+            # a single-shot prefill sets seq_len to the full prompt before this
+            # runs, so this is a no-op for the current path and the correct bound
+            # for a chunk.
+            n_pages = int(kvc.n_pages)
             global_page_indices.append(kvc.c2p[0, :n_pages].to(self.device).to(torch.int32))
             kv_indptr_parts.append(kv_indptr_parts[-1] + n_pages)
             last_page_lens.append(int(kvc.last_page_len))
@@ -780,11 +843,11 @@ class BatchInferState:
     # CSR metadata assembly
     # ------------------------------------------------------------------ #
     def build_attention_metadata(self, layer_idx):
-        """Return CSR page metadata across active requests, in active-slot order."""
+        """Return CSR page metadata across the decode rows, in slot order."""
         self._ensure_open()
         if not 0 <= layer_idx < self.n_layers:
             raise IndexError("layer_idx out of range")
-        active = self.active_indices
+        active = self._decode_slots
         caches = [self.states[i].kv_caches[layer_idx] for i in active]
         counts = [int(c.n_real_pages) for c in caches]
         if any(n < 1 for n in counts):
@@ -871,7 +934,8 @@ class BatchInferState:
             raise IndexError("layer_idx out of range")
         if not isinstance(query_states, torch.Tensor):
             raise TypeError("query_states must be a tensor")
-        bsz = self.batch_size
+        active = self._decode_slots
+        bsz = len(active)
         if query_states.shape != (bsz, 1, self.n_qo_heads, self.head_dim):
             raise ValueError("query_states must be [batch,1,num_qo_heads,head_dim]")
         if query_states.device != self.device:
@@ -881,7 +945,7 @@ class BatchInferState:
             raise ValueError("num_neighbours must contain one value per active request")
         if field_of_view is not None and len(field_of_view) != bsz:
             raise ValueError("field_of_view must contain one value per active request")
-        active = self.active_indices
+        active = self._decode_slots
         pos_of = {i: pos for pos, i in enumerate(active)}
         if num_neighbours is not None:
             for pos, i in enumerate(active):
@@ -985,7 +1049,7 @@ class BatchInferState:
         # An individual InferState may fail after beginning only some handlers.
         # Mark before the first call so the failed step can release them all.
         self._decode_handlers_armed = True
-        for i in self.active_indices:
+        for i in self._decode_slots:
             # Per-slot _prepare_decode also begins that slot's own decode
             # handler (infer_state._prepare_decode -> decode_handler_tab[b].
             # begin_forward).  That begin_forward is redundant for THIS batch's
@@ -999,7 +1063,9 @@ class BatchInferState:
     def _cleanup_decode_handlers(self):
         if not self._decode_handlers_armed:
             return
-        for i in self.active_indices:
+        # Only the decode rows ever had a handler armed, so this must follow the
+        # same restricted set ``_prepare_decode`` used.
+        for i in self._decode_slots:
             for handler in self.states[i].decode_handler_tab.values():
                 if getattr(handler, "_paged_kv_indptr", None) is None:
                     continue
@@ -1108,7 +1174,7 @@ class BatchInferState:
         return output
 
     def _finish_decode(self):
-        for i in self.active_indices:
+        for i in self._decode_slots:
             self.states[i]._finish_decode(1)
         self._decode_handlers_armed = False
         self.decode_steps += 1

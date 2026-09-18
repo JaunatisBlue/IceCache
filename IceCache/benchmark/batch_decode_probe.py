@@ -34,6 +34,9 @@ except ImportError:
 
 from icecache.kv_cache import KvPool
 
+# Safety factor on the derived CPU page budget (see the derivation in main()).
+_CPU_POOL_SAFETY = 1.5
+
 
 def make_prompt(tokenizer, length: int, seed: int, device: torch.device):
     rng = random.Random(seed)
@@ -148,7 +151,12 @@ def main():
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--gpu-pages", type=int, default=0,
                         help="GPU page pool size; 0 = size it from the prompt lengths")
-    parser.add_argument("--cpu-pages-per-request", type=int, default=4096)
+    parser.add_argument("--cpu-pages-per-request", type=int, default=0,
+                        help="CPU page budget **per layer**, multiplied by the layer count to size "
+                             "the request's CPU pool (one pool serves every layer, so the pool must "
+                             "hold n_layers x per-layer pages). 0 = derive it from the prompt "
+                             "lengths, which is what a long prompt needs: a 4096-token prompt needs "
+                             "about 240 pages per layer, i.e. ~7700 pages for 32 layers")
     parser.add_argument("--query-backend", choices=("serial", "native"), default="serial")
     parser.add_argument("--query-threads", type=int, default=16)
     parser.add_argument("--prefill-mode", choices=("sequential", "batched"), default="sequential",
@@ -212,6 +220,29 @@ def main():
         head_dim, torch.float16, device, (0, 2, 1, 3),
     )
 
+    # A request's CPU pool is *one* pool shared by every layer (infer_state builds
+    # n_layers KvCaches on the same PagePool), and every request owns one such
+    # pool, so the requirement is per request: n_layers x (pages *this* prompt
+    # needs per layer), bounded by the longest prompt in the batch.  Reading the
+    # old flat number as a total is what made a 4096-token prompt die with
+    # "Not enough contiguous free pages in pool" -- ~240 pages per layer x 32
+    # layers is ~7700 pages, well past the old 4096.
+    #
+    # Oversizing it is not free either: the pool is allocated with
+    # pin_memory=True, and the measured effect of a too-large pool is large
+    # (skewed: 10240 pages -> 3.81 s prefill, 62976 pages -> 6.00 s). So the
+    # derivation stays tight: one page per token written, times a small safety
+    # factor for the temp/selected CPU caches infer_state allocates alongside the
+    # main one. Measured peak usage at 1.5x is ~25% below the pool size.
+    cpu_pages_derived = int(_CPU_POOL_SAFETY * cfg.num_hidden_layers * max(
+        pages_for(L) for L in initial_lens + ([admit_len] if admit_len else [])
+    ))
+    cpu_pages = (args.cpu_pages_per_request * cfg.num_hidden_layers
+                 if args.cpu_pages_per_request > 0 else cpu_pages_derived)
+    print(f"cpu_pages={cpu_pages} (per layer "
+          f"{cpu_pages // cfg.num_hidden_layers}"
+          f"{'' if args.cpu_pages_per_request else ', derived'})", flush=True)
+
     def make_state():
         return InferState(
             n_layers=cfg.num_hidden_layers,
@@ -228,12 +259,15 @@ def main():
             n_prefetch_layers=0,
             n_reuse_layers=0,
             n_max_pages=gpu_pages,
-            n_max_cpu_pages=args.cpu_pages_per_request,
+            n_max_cpu_pages=cpu_pages,
             gpu_pool=gpu_pool,
         )
 
     n = args.batch_size
     states = [make_state() for _ in range(n)]
+    # Kept separately because slot 0 is the one the probe retires, and the pool
+    # outlives the state for reporting purposes.
+    cpu_pool_ref = states[0]._cpu_pool
     enable_icecache(model, dtype=torch.float16, device=device,
                     infer_state=states[0])
 
@@ -469,6 +503,16 @@ def main():
             "min": s[0], "max": s[-1],
         }
 
+    def _pool_stats(pool):
+        """Free pages alone cannot tell "full" from "fragmented"; the largest free
+        run and the run-failure count can, and prefill only cares about the run."""
+        return {
+            "n_max_pages": pool.n_max_pages,
+            "n_free_pages": pool.n_free_pages,
+            "max_contiguous_free_pages": pool.max_contiguous_free_pages(),
+            "n_alloc_run_failures": getattr(pool, "n_alloc_run_failures", None),
+        }
+
     measured = step_ms[2:args.steps]
     step_stats = {
         "decode": _stats(measured),
@@ -521,6 +565,8 @@ def main():
         "serial_query_seconds": getattr(batch, "serial_query_seconds", None),
         "qprof_ms_per_call": qprof_snapshot(),
         "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
+        "gpu_pool": _pool_stats(gpu_pool),
+        "cpu_pool_request0": _pool_stats(cpu_pool_ref),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(summary, indent=2) + "\n")

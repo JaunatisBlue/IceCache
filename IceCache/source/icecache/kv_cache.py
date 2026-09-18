@@ -22,6 +22,22 @@ class PagePool:
             pin_memory=(self.device.type == "cpu"),
         )
         self._free_ids = set(range(self.n_max_pages))
+        # Two-ended allocation.  The decode path needs one page at a time, the
+        # prefill path needs a long contiguous run (one run per layer, sized for
+        # the whole prompt).  Drawn from a single unordered free set, every decode
+        # page can land inside the region a prefill run needs, so the largest free
+        # run collapses long before the pool is actually full -- which is exactly
+        # the ``Not enough contiguous free pages in pool`` failure.  Taking single
+        # pages from the *low* end and runs from the *high* end makes that
+        # structurally impossible: the two fronts can only meet when the pool is
+        # genuinely exhausted, and prefill contiguity stops depending on how much
+        # decode traffic happened first.  Required for mixed prefill/decode
+        # batching, where both allocate from this pool inside one forward.
+        self._next_low = 0
+        self._reclaimed_low = []
+        # Diagnostics: run failures and the current largest free run are what tell
+        # "out of pages" apart from "fragmented", so callers can report either.
+        self.n_alloc_run_failures = 0
 
     def __getitem__(self, idx):
         return self.buffer[idx]
@@ -30,35 +46,75 @@ class PagePool:
     def n_free_pages(self):
         return len(self._free_ids)
 
+    def max_contiguous_free_pages(self):
+        """Length of the largest run of adjacent free pages.
+
+        The prefill path can only satisfy a request of ``n`` pages when this is at
+        least ``n``, so it is the number that decides whether a prefill fits --
+        ``n_free_pages`` on its own does not.
+        """
+        best = 0
+        run = 0
+        previous = -2
+        for page_id in sorted(self._free_ids):
+            run = run + 1 if page_id == previous + 1 else 1
+            previous = page_id
+            if run > best:
+                best = run
+        return best
+
     def alloc_page(self):
-        return self._free_ids.pop()
-    
+        """One page for the decode path, taken from the low end of the pool."""
+        # Pages freed below the cursor are kept aside: the forward scan below would
+        # never look at them again, and letting them pile up there would waste the
+        # low end that decode is supposed to consume first.
+        if self._reclaimed_low:
+            return self._reclaimed_low.pop()
+        while self._next_low < self.n_max_pages:
+            page_id = self._next_low
+            self._next_low += 1
+            if page_id in self._free_ids:
+                self._free_ids.discard(page_id)
+                return page_id
+        raise RuntimeError("page pool exhausted (no free page left)")
+
     def alloc_contiguous_pages(self, num):
+        """``num`` adjacent pages for the prefill path, from the high end.
+
+        Returns the pages in ascending order (the order callers map onto logical
+        page ids), or ``None`` when no free run is long enough.
+        """
         if num <= 0:
             return []
         
         if len(self._free_ids) < num:
+            self.n_alloc_run_failures += 1
             return None  # Not enough free IDs
     
-        sorted_ids = sorted(self._free_ids)
+        sorted_ids = sorted(self._free_ids, reverse=True)
         
         for i in range(len(sorted_ids) - num + 1):
             # Check if we have num contiguous IDs starting at sorted_ids[i]
-            if sorted_ids[i + num - 1] - sorted_ids[i] == num - 1:
-                result = list(range(sorted_ids[i], sorted_ids[i] + num))
+            if sorted_ids[i] - sorted_ids[i + num - 1] == num - 1:
+                result = list(range(sorted_ids[i + num - 1], sorted_ids[i] + 1))
                 # Remove the allocated IDs from free set
                 self._free_ids -= set(result)
                 return result
         
+        self.n_alloc_run_failures += 1
         return None  # No contiguous block found
 
     def free_page(self, page_id):
         assert 0 <= page_id < self.n_max_pages
         assert page_id not in self._free_ids
         self._free_ids.add(page_id)
+        if page_id < self._next_low:
+            self._reclaimed_low.append(page_id)
 
     def clear(self):
         self._free_ids = set(range(self.n_max_pages))
+        self._next_low = 0
+        self._reclaimed_low = []
 
 
 class KvPool(PagePool):
@@ -217,7 +273,44 @@ class KvCache:
             [self._decode_alloc_1_page(alloc_page=alloc_page) for _ in range(n_new_pages)]
         return n_new_pages
 
+    def reserve_prefill_pages(self, n_pages, alloc_page=None):
+        """Reserve the whole contiguous run a prompt will need, in one go.
+
+        ``prefill_alloc_n_tokens`` is called once per layer for a whole prompt, but
+        it becomes once per layer **per chunk** as soon as a prompt is split
+        (chunked prefill, and the mixed prefill/decode batch it enables).  A run has
+        to be reserved for the *whole* prompt up front, because the chunk that
+        follows must land immediately after the previous one: ``c2p`` is what the
+        KV write and the paged attention address the sequence through, so a chunk
+        that landed in a second block would silently split the sequence and the
+        attention would read the wrong pages.  Reserving up front also means no
+        page is allocated mid-sequence, so a concurrent decode allocation cannot
+        fragment a growing prefill run.
+
+        Returns the number of pages newly reserved (0 when it already fits).
+        """
+        if self.batch_size != 1:
+            raise ValueError("reserving a contiguous prefill run requires batch_size == 1")
+        before = self.n_real_pages
+        self._prefill_alloc_n_pages(n_pages, alloc_page=alloc_page)
+        return self.n_real_pages - before
+
     def _prefill_alloc_n_pages(self, n, alloc_page=None):
+        """Ensure the cache owns ``n`` adjacent pages in total.
+
+        The previous revision always *replaced* ``c2p`` with a fresh run sized only
+        for the delta, which both leaked the run it replaced and broke the
+        adjacency a second chunk depends on -- so a chunked prefill could not work
+        at all.  Now the run is allocated once and later calls only confirm that the
+        reservation is large enough.
+        """
+        if self.n_real_pages >= n:
+            return
+        if self.n_real_pages:
+            raise RuntimeError(
+                f"prefill run holds {self.n_real_pages} pages but {n} are needed and it "
+                "cannot grow: reserve the whole prompt with reserve_prefill_pages() "
+                "before the first chunk")
         if n == 1:
             alloc_page = alloc_page or self.pool.alloc_page
             self.c2p = torch.tensor(
@@ -226,9 +319,12 @@ class KvCache:
         elif n > 1:
             pages = self.pool.alloc_contiguous_pages(n)
             if pages is None:
-                raise RuntimeError("Not enough contiguous free pages in pool")
+                raise RuntimeError(
+                    f"Not enough contiguous free pages in pool: need {n}, largest free "
+                    f"run is {self.pool.max_contiguous_free_pages()}, and "
+                    f"{self.pool.n_free_pages} pages are free in total")
             self.c2p = torch.tensor(
-                [pages for _ in range(self.batch_size)], **self._i32
+                [list(pages) for _ in range(self.batch_size)], **self._i32
             )
 
     def prefill_alloc_n_tokens(self, n, alloc_page=None):
