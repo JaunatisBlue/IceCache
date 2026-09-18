@@ -3,6 +3,19 @@
 日期：2026-09-18 ｜ 前置提交：`0e90ac9`（阶段 1/2/2b/3/5）｜ 机型：A100 80GB PCIe，Llama-3.1-8B-Instruct，fp16
 相关：`BATCH_PARALLELIZATION_PLAN.md`（§3 阶段 4 的定位）、`BATCH_CODE_FLOW.md`、`BATCH_DECODE.md`
 
+## 实施状态
+
+| 步骤 | 内容 | 状态 | 验证 |
+|---|---|---|---|
+| A | 页池：双向分配 + 增长语义 + 容量派生 | **已完成** | `test_page_pool_two_ended.py` 17/17 PASS；GPU 复验 uniform/skewed/sequential 全 exit=0，无回归，skewed 默认参数即可跑 |
+| C1 | 抽出 `icecache_continuation_layer`（serial/batch 共用） | **已完成** | `tests/test_b1_chunked_continuation.py` + `test_c1_sparse_continuation.py` → 8 passed, 1 xfailed |
+| C2 | 受限 row 集 `_decode_slots`（6 处） | **已完成** | decode-only 路径逐 token 相同 |
+| C3 | `mixed_attention_forward`（按行分派） | 待实现 | — |
+| C4 | `step_mixed` + `begin_chunked_prefill` | 待实现 | — |
+| C5 | `batch_mixed_probe.py`（等价性 / 阻塞性） | 待实现 | — |
+
+已提交：`c59ffbd`（A + C1 + C2）。
+
 ---
 
 ## 0. 一句话
