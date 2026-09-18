@@ -25,6 +25,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from icecache.adapter import enable_icecache, icecache_state
 from icecache.batch import BatchInferState
 from icecache.infer_state import ForwardMode, InferState
+
+try:  # the query-side profiler exists only after the stage-2 revision
+    from icecache.infer_state import qprof_snapshot
+except ImportError:
+    def qprof_snapshot():
+        return None
+
 from icecache.kv_cache import KvPool
 
 
@@ -147,6 +154,16 @@ def main():
     parser.add_argument("--prefill-mode", choices=("sequential", "batched"), default="sequential",
                         help="sequential = per-request model(...) prefill (default, unchanged); "
                              "batched = one padded model(...) forward over all B prompts, trees built per request")
+    parser.add_argument("--length-profile", choices=("uniform", "skewed"), default="uniform",
+                        help="uniform = every prompt near --prompt-tokens (default); "
+                             "skewed = request 0 carries --skewed-ratio x the tokens of the rest, "
+                             "which is the shape a long tool result produces in an agent batch")
+    parser.add_argument("--skewed-ratio", type=int, default=4,
+                        help="ratio between the longest and the remaining prompts in --length-profile skewed")
+    parser.add_argument("--prefill-token-budget", type=int, default=0,
+                        help="0 = one padded forward for the whole batch (default); "
+                             "N = split the batch into length-similar groups whose padded row count "
+                             "stays within N tokens, so each forward pads to its own group's Lmax")
     parser.add_argument("--compare-native-raw", action="store_true")
     parser.add_argument("--cpu-replay-repeats", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
@@ -168,6 +185,8 @@ def main():
 
     def prompt_len(i):
         """Distinct prompt length per request, each above the GPU page budget."""
+        if args.length_profile == "skewed" and i == 0:
+            return args.prompt_tokens * args.skewed_ratio
         return args.prompt_tokens + i * args.page_size
 
     def pages_for(tokens):
@@ -244,10 +263,27 @@ def main():
                 prompt_lens.append(length_slot)
             torch.cuda.synchronize()
             start = time.perf_counter()
-            out, next_tokens = batch.prefill_batch(model, prompts)
+            try:
+                out, next_tokens = batch.prefill_batch(
+                    model, prompts,
+                    token_budget=args.prefill_token_budget or None)
+            except TypeError:
+                # Revisions before length grouping take no token budget.  Keeping
+                # the fallback lets the pre-change revision be measured with this
+                # same timing protocol, which is the only way the two are
+                # comparable (see the plan document's stage-5 note).
+                if args.prefill_token_budget:
+                    raise
+                out, next_tokens = batch.prefill_batch(model, prompts)
             torch.cuda.synchronize()
             prefill_seconds = [time.perf_counter() - start]
             tokens = list(next_tokens)
+            _padded = getattr(batch, "prefill_padded_rows", None)
+            _real = getattr(batch, "prefill_real_rows", None)
+            if _padded:
+                print(f"batched prefill forwards={getattr(batch, 'prefill_groups', None)} "
+                      f"padded_rows={_padded} real_rows={_real} "
+                      f"padding={1 - _real / _padded:.1%}", flush=True)
             for slot in batch.active_indices:
                 # A prompt within the page budget legitimately stays non-sparse.
                 if states[slot].use_dci and any(db is None for db in states[slot].dci_db):
@@ -415,13 +451,40 @@ def main():
             raise AssertionError(f"requests own overlapping GPU pages after decode: {sorted(overlap)[:8]}")
         seen_pages |= allocated_pages(state)
 
-    measured = step_ms[min(8, len(step_ms)) :]
+    # Per-phase step statistics.  ``step_ms`` holds the main decode phase only,
+    # in order; the first two steps are cold (first touch of the patched handlers
+    # and of the paged pool) and are dropped, matching the pairing protocol the
+    # plan's A/B results use.  A bare mean hides the spread that decides whether
+    # two configurations are actually apart, so p50/p95/std come with it.
+    def _stats(xs):
+        if not xs:
+            return None
+        s = sorted(xs)
+        mean = sum(s) / len(s)
+        var = sum((v - mean) ** 2 for v in s) / len(s)
+        return {
+            "n": len(s), "mean": mean, "std": var ** 0.5,
+            "p50": s[int(round(0.50 * (len(s) - 1)))],
+            "p95": s[int(round(0.95 * (len(s) - 1)))],
+            "min": s[0], "max": s[-1],
+        }
+
+    measured = step_ms[2:args.steps]
+    step_stats = {
+        "decode": _stats(measured),
+        "decode_including_cold": _stats(step_ms[:args.steps]),
+        "retire": _stats(retire_step_ms[1:]),
+        "admit": _stats(admit_step_ms[1:]),
+    }
     import dciknn._dci as installed_dci
     dci_path = Path(installed_dci.__file__)
     summary = {
         "config": vars(args) | {"output": str(args.output)},
         "prefill_seconds": prefill_seconds,
         "prefill_mode": args.prefill_mode,
+        "prefill_groups": getattr(batch, "prefill_groups", None),
+        "prefill_padded_rows": getattr(batch, "prefill_padded_rows", None),
+        "prefill_real_rows": getattr(batch, "prefill_real_rows", None),
         "runtime": {
             "torch": torch.__version__,
             "dci_path": str(dci_path),
@@ -447,9 +510,16 @@ def main():
         "mean_step_ms_after_warmup": sum(measured) / len(measured) if measured else None,
         "output_tokens_per_second_after_warmup":
             1000.0 * n * len(measured) / sum(measured) if measured else None,
+        "step_stats": step_stats,
         "retire_step_ms": retire_step_ms,
         "admit_step_ms": admit_step_ms,
-        "batch_query_seconds": batch.batch_query_seconds,
+        # Timing counters added by the parallelisation revisions; absent on the
+        # pre-change revision, which this probe also has to measure.
+        "batch_query_seconds": getattr(batch, "batch_query_seconds", None),
+        "native_search_seconds": getattr(batch, "native_search_seconds", None),
+        "native_bookkeep_seconds": getattr(batch, "native_bookkeep_seconds", None),
+        "serial_query_seconds": getattr(batch, "serial_query_seconds", None),
+        "qprof_ms_per_call": qprof_snapshot(),
         "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

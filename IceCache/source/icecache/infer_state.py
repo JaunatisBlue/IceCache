@@ -22,6 +22,26 @@ from tqdm import tqdm
 import copy
 from ctypes import c_float, POINTER, cast, c_void_p
 
+import os as _os
+
+# Optional fine-grained profiler for the DCI query hot path (ICECACHE_QPROF=1).
+# Off by default, so a normal run pays one boolean test per query.  The buckets
+# split the per-request bookkeeping that dominates a batched decode step into the
+# numpy prep, the tree diff (incl. its device->host reads), and the device
+# uploads, so the next optimisation can target measured cost rather than guesswork.
+QPROF = {"calls": 0, "total": 0.0, "pre": 0.0, "diff": 0.0, "upload": 0.0}
+_PROFILE_QUERY = _os.environ.get("ICECACHE_QPROF") == "1"
+
+
+def qprof_snapshot():
+    """Per-call breakdown (milliseconds) of the DCI query hot path."""
+    calls = QPROF["calls"] or 1
+    out = {"calls": QPROF["calls"]}
+    for key in ("total", "pre", "diff", "upload"):
+        out[key] = 1000.0 * QPROF[key] / calls
+    out["other"] = out["total"] - out["pre"] - out["diff"] - out["upload"]
+    return out
+
 class DeprecatedError(NotImplementedError):
     pass
 
@@ -197,6 +217,12 @@ class InferState:
         self.prev_rids = None
         self.prev_index = None
         self.prev_offset = None
+        # Host copies of the last DCI query's page ids (set by _DCI_query).  The
+        # batched recall path consumes them so it does not pay a device->host
+        # round trip for every request and layer.
+        self._last_recall_np = None
+        self._last_evict_np = None
+        self._last_nr_np = None
 
         # TODO (Qitong):
         wbufs = [torch.empty(16 * 1024 * 1024, **self._u8)
@@ -1026,10 +1052,17 @@ class InferState:
                 [kvc.c2p[:, :ns], kvc.c2p[:, -kvc.budget + ns:]], dim=-1)
 
             self.kvc_capacity[cur_id] = 1 << (int(max_num_leaves) - 1).bit_length()
-            kvc.cc2gp = torch.full(
-                [kvc.batch_size, self.n_kv_heads, self.kvc_capacity[cur_id]], -1,  **self._ci32)
-            kvc.ccc = torch.ones(
-                [kvc.batch_size, self.n_kv_heads, self.kvc_capacity[cur_id]], **self._cb)
+            # cc2gp / ccc are consumed only through host arrays -- they are handed
+            # to the DCI bindings and indexed for bookkeeping, never used in a
+            # kernel -- so they live in host numpy, exactly like the
+            # page_address_buffer next to them.  Keeping them on the device cost
+            # three transfers per (request, layer) in the decode hot path (two
+            # device->host reads plus one upload); the query profiler showed that
+            # as a large share of the per-query bookkeeping.
+            kvc.cc2gp = np.full(
+                [kvc.batch_size, self.n_kv_heads, self.kvc_capacity[cur_id]], -1, dtype=np.int32)
+            kvc.ccc = np.ones(
+                [kvc.batch_size, self.n_kv_heads, self.kvc_capacity[cur_id]], dtype=bool)
             self.page_address_buffer[cur_id] = np.full(
                 [kvc.batch_size, self.n_kv_heads, self.kvc_capacity[cur_id]], -1, dtype=np.uintp)
 
@@ -1098,8 +1131,8 @@ class InferState:
                 self.prev_num_pages = copy.deepcopy(self.dci_db[cur_id].num_leaves)
                 self.prev_index, self.prev_offset = self.dci_db[cur_id].token2node
 
-                ccc = kvc.ccc[b][:, :prev_max_num_pages].numpy().astype(
-                    np.bool_).reshape(self.batch_size*self.n_kv_heads, -1)
+                ccc = np.ascontiguousarray(kvc.ccc[b][:, :prev_max_num_pages]).reshape(
+                    self.batch_size*self.n_kv_heads, -1)
 
                 _, _ = self.dci_db[cur_id].add_query(_key_states, None, _value_states,
                                                     padding_mask,
@@ -1126,15 +1159,17 @@ class InferState:
                                                     changed_page_list=ccc,
                                                     )
 
-                kvc.ccc[b][:, :prev_max_num_pages] = torch.tensor(
-                    ccc, **self._cb).reshape(self.n_kv_heads, -1)
+                kvc.ccc[b][:, :prev_max_num_pages] = np.asarray(
+                    ccc, dtype=bool).reshape(self.n_kv_heads, -1)
                 
                 dci_db = self.dci_db[cur_id]
             else:
                 reuse_id = self.check_reuse(cur_id)
                 dci_db = self.dci_db[reuse_id]
-                kvc.ccc = self.kv_caches[reuse_id].ccc.clone()
-                reuse_ccc = kvc.ccc[b][:, :dci_db.num_leaves.max()].numpy().astype(np.bool_).reshape(self.batch_size*self.n_kv_heads, -1)
+                kvc.ccc = self.kv_caches[reuse_id].ccc.copy()
+                reuse_ccc = np.ascontiguousarray(
+                    kvc.ccc[b][:, :dci_db.num_leaves.max()]).reshape(
+                    self.batch_size*self.n_kv_heads, -1)
 
             # For DCI tokens
             max_num_pages = dci_db.num_leaves.max()
@@ -1148,18 +1183,18 @@ class InferState:
                     prev_kvc_capacity = self.kvc_capacity[cur_id]
                     self.kvc_capacity[cur_id] = 1 << (
                         int(max_num_pages) - 1).bit_length()
-                    kvc.cc2gp = utils.cat(
-                        kvc.cc2gp,
-                        torch.full([self.batch_size, self.n_kv_heads,
-                                   self.kvc_capacity[cur_id] - prev_kvc_capacity], -1, **self._ci32),
-                        dim=-1,
+                    kvc.cc2gp = np.concatenate(
+                        [kvc.cc2gp,
+                         np.full([self.batch_size, self.n_kv_heads,
+                                  self.kvc_capacity[cur_id] - prev_kvc_capacity], -1, dtype=np.int32)],
+                        axis=-1,
                     )
                     if self.check_reuse(cur_id) == 0:
-                        kvc.ccc = utils.cat(
-                            kvc.ccc,
-                            torch.ones([self.batch_size, self.n_kv_heads,
-                                    self.kvc_capacity[cur_id] - prev_kvc_capacity], **self._cb),
-                            dim=-1,
+                        kvc.ccc = np.concatenate(
+                            [kvc.ccc,
+                             np.ones([self.batch_size, self.n_kv_heads,
+                                      self.kvc_capacity[cur_id] - prev_kvc_capacity], dtype=bool)],
+                            axis=-1,
                         )
                     self.page_address_buffer[cur_id] = np.concatenate(
                         [
@@ -1197,8 +1232,9 @@ class InferState:
 
 
     def _DCI_query(self, b, cur_id, query_states, nn_idx_override=None,
-                   field_of_view_override=None):
+                   field_of_view_override=None, return_host=False):
         if self.use_dci:
+            _tstart = time() if _PROFILE_QUERY else 0.0
 
             bsz = 1
 
@@ -1242,6 +1278,8 @@ class InferState:
                 if nn_idx.size != self.n_qo_heads * 2 * num_neighbours:
                     raise ValueError("native batch DCI result has the wrong size")
 
+            if _PROFILE_QUERY:
+                _tp = time()
             nn_idx = nn_idx.reshape(self.n_qo_heads, 2, -1)
             nn_idx_0 = nn_idx[:, 0, :].reshape(self.n_kv_heads, self.ratio, -1)
             nn_idx_1 = nn_idx[:, 1, :].reshape(self.n_kv_heads, self.ratio, -1)
@@ -1259,26 +1297,59 @@ class InferState:
 
             nn_idx_0 = np.ascontiguousarray(nn_idx_0)
             nn_idx_1 = np.ascontiguousarray(nn_idx_1)
+            if _PROFILE_QUERY:
+                QPROF["pre"] += time() - _tp
+                _td = time()
 
-            padded_arrays = torch.tensor(nn_idx_0, **self._ci32)
-            head_ids = torch.arange(
-                self.n_kv_heads, device=padded_arrays.device).unsqueeze(1)
+            padded_arrays = np.ascontiguousarray(nn_idx_0)
+            head_ids = np.arange(self.n_kv_heads)[:, None]
 
             if self.selected_page_idx[cur_id] is None:
                 # evicted_idx, recall_idx, evict_num
                 ns = kvc.n_sink_pages
                 self.selected_page_idx[cur_id] = nn_idx_0
-                recall_idx = torch.tensor(nn_idx_0, **self._i32)
+                recall_idx_np = np.ascontiguousarray(nn_idx_0)
                 evicted_idx = kvc.c2p[b, torch.arange(ns, num_neighbours + ns, **self._i32)].unsqueeze(0).expand(self.n_kv_heads, -1)
-                kvc.cc2gp[b, head_ids, padded_arrays] = evicted_idx.cpu()
+                evicted_idx_np = np.ascontiguousarray(evicted_idx.cpu().numpy())
+                kvc.cc2gp[b, head_ids, padded_arrays] = evicted_idx_np
             else:
-                recall_idx, evicted_idx, out_idx = DCI.diff_pages_by_head(nn_idx_0, self.selected_page_idx[cur_id], kvc.ccc[b, head_ids, padded_arrays].numpy(), kvc.cc2gp[b].numpy())
+                recall_idx_np, evicted_idx_np, out_idx = DCI.diff_pages_by_head(nn_idx_0, self.selected_page_idx[cur_id], kvc.ccc[b, head_ids, padded_arrays], kvc.cc2gp[b])
                 self.selected_page_idx[cur_id] = out_idx
-                recall_idx = torch.tensor(recall_idx, **self._i32)
-                evicted_idx = torch.tensor(evicted_idx, **self._i32)
-            
+                recall_idx_np = np.ascontiguousarray(recall_idx_np)
+                evicted_idx_np = np.ascontiguousarray(evicted_idx_np)
+            if _PROFILE_QUERY:
+                QPROF["diff"] += time() - _td
+                _tu = time()
+
+            # Host copies of the page ids, so a batched caller can feed
+            # ``recall_np`` without paying a device->host round trip for every
+            # request and layer (each of those forces a synchronisation).
+            self._last_recall_np = recall_idx_np
+            self._last_evict_np = evicted_idx_np
+            # int64 on purpose: scatter_pages() asserts a Long n_evicts tensor,
+            # which the device path got for free from torch.sum's promotion.
+            nr_np = np.maximum((recall_idx_np >= 0).sum(axis=1), 0).astype(np.int64)
+            self._last_nr_np = nr_np
+
+            kvc.ccc[b, head_ids, padded_arrays] = False
+
+            if return_host:
+                # Batched caller: it uploads every request's scatter operands once
+                # per layer, so the per-request device tensors and the per-request
+                # device reduction here would be pure overhead.
+                if _PROFILE_QUERY:
+                    QPROF["upload"] += time() - _tu
+                    QPROF["total"] += time() - _tstart
+                    QPROF["calls"] += 1
+                return evicted_idx_np, recall_idx_np, nr_np
+
+            recall_idx = torch.tensor(recall_idx_np, **self._i32)
+            evicted_idx = torch.tensor(evicted_idx_np, **self._i32)
             evict_num = (recall_idx >= 0).sum(1)
-            kvc.ccc[b, head_ids, padded_arrays] = 0
+            if _PROFILE_QUERY:
+                QPROF["upload"] += time() - _tu
+                QPROF["total"] += time() - _tstart
+                QPROF["calls"] += 1
 
             return evicted_idx.contiguous(), recall_idx.contiguous(), evict_num
 
@@ -1391,7 +1462,23 @@ class InferState:
             self.layout,
         )
 
-    def recall(self, layer_idx: int, b: int, rids: Tensor, nr: Tensor):
+    def recall(self, layer_idx: int, b: int, rids: Tensor, nr: Tensor, stream=None):
+        """Device-tensor entry point; delegates to :meth:`recall_np`."""
+        return self.recall_np(
+            layer_idx, b, rids.cpu().numpy(), nr.cpu().numpy(), stream=stream)
+
+    def recall_np(self, layer_idx: int, b: int, rids_np, nr_np, stream=None):
+        """Issue the CPU -> transit -> cast copy for the given page ids.
+
+        ``rids_np`` / ``nr_np`` are **host** arrays (``[n_kv_heads, k]`` and
+        ``[n_kv_heads]``).  Taking them on the host is what lets a batched caller
+        skip the per-request ``.cpu()`` / ``.item()`` round trips that otherwise
+        force a device synchronisation for every request and layer; the
+        device-tensor ``recall`` above preserves the original single-request
+        behaviour by transferring once and delegating here.  ``stream`` selects
+        the stream the copies are issued on -- a batched caller passes one shared
+        stream so that a single synchronise covers every request.
+        """
         thread_id = threading.get_ident()
         if hasattr(self, '_thread_locals') and thread_id in self._thread_locals:
             thread_local = self._thread_locals[thread_id]
@@ -1400,16 +1487,18 @@ class InferState:
         else:
             # Fallback to main thread CUDA objects
             c2g_stream = self.c2g_stream
+        if stream is not None:
+            c2g_stream = stream
 
-        n_transit_pages = torch.sum(nr).item()
-
-        rids_cpu = rids.cpu()
-        nr_cpu = nr.cpu()
+        n_transit_pages = int(np.sum(nr_np))
 
         counter = 0
         for i in range(self.n_kv_heads):
-            self._src_address_buffer[counter:counter+nr_cpu[i].item()] = self.page_address_buffer[layer_idx][b, i, rids_cpu[i, :nr_cpu[i]]]
-            counter += nr_cpu[i].item()
+            c = int(nr_np[i])
+            if c:
+                self._src_address_buffer[counter:counter + c] = \
+                    self.page_address_buffer[layer_idx][b, i, rids_np[i, :c]]
+            counter += c
 
         with torch.cuda.stream(c2g_stream):
 

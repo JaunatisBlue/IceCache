@@ -245,15 +245,26 @@ decode path, the KV-allocation strategy and the `b == 0` semantics of every
   so it can be created *before* prefill; the probe's existing
   `from_prefilled(...)` keeps `prefilled=True` (default) for the serial path
   (`batch.py:186`).
-- `batch.prefill_batch(model, prompts)`
-  (`batch.py:193`) performs the batched prefill:
+- `batch.prefill_batch(model, prompts, token_budget=None)`
+  (`batch.py:311`) performs the batched prefill:
   - `prompts`: list of 1-D `LongTensor` token ids, one per active slot in
     `active_indices` order.
-  - Pads to a dense `[B, Lmax]` `input_ids` / `position_ids` (each row's real
-    positions are `0..L_i-1`; padding rows are zero). One `model(...)`.
-  - Returns `(logits, next_tokens)` with `logits` shape `[B, Lmax, vocab]` (the
-    patched LM head is temporarily un-truncated so every request's last real
-    token is readable) and `next_tokens[i] = argmax(logits[i, L_i-1])`.
+  - With `token_budget=None` all prompts pad to a dense `[B, Lmax]`
+    `input_ids` / `position_ids` (each row's real positions are `0..L_i-1`;
+    padding rows are zero) and one `model(...)` is run. With a budget the rows
+    are first split into length-similar groups by `_plan_prefill_groups`
+    (`batch.py:286`, longest-first packing), each group then pads to its own
+    group `Lmax` and gets its own `model(...)`; the split is only accepted when
+    it removes at least `_PREFILL_GROUP_MIN_GAIN` (1.15x) of the padding, so a
+    length-uniform batch still runs as a single forward. `prefill_groups`,
+    `prefill_padded_rows` and `prefill_real_rows` report what happened.
+  - Returns `(logits, next_tokens)` with `logits` shape `[B, 1, vocab]` and
+    `next_tokens[i] = argmax(logits[i, 0])`. Only each request's last *real*
+    token is materialised: the LM head is patched to `gather` that position
+    first and then project it, so the head's GEMM and its output tensor scale
+    with `B` rather than `B * Lmax` (at B=8, Lmax=1136: 8 rows instead of 9088,
+    2 MB instead of 2.3 GB). `ICECACHE_PREFILL_FULL_LOGITS=1` restores the
+    previous "project everything, then slice" behaviour for paired measurement.
 - `ForwardMode.BATCH_PREFILL` (`infer_state.py:48`) is the new mode.
   `_icecache_attn_forward` (`adapter/modeling.py:478`) routes a `BatchInferState`
   whose `forward_mode` is `BATCH_PREFILL` to
@@ -380,24 +391,37 @@ for large B is not characterised, and a warning fires above 1 GiB.
 
 ### Verification (2026-09-17)
 
-**Equivalence with the serial prefill.** Two runs with identical arguments
-(`--batch-size 2`, serial DCI backend, `--steps 8 --extra-steps 4
---post-admit-steps 4`, same seeds, greedy decode) that differ *only* in
-`--prefill-mode` produced identical results:
+**Numerical relation to the serial prefill (revised 2026-09-17).** An earlier
+revision of this section claimed the two prefill modes produce *identical*
+`generated_token_ids`. That happened to hold for the small B=2 / 4-step runs it
+was measured on, but it is **not** a property of the implementation. The measured
+relation is:
 
-| Field | sequential | batched |
-|---|---|---|
-| `generated_token_ids` | — | **identical** (20 tokens: 4 + 16) |
-| `native_points_before` / `after` | — | **identical** |
-| `decode_steps` | 12 | 12 |
-| `query_counts_by_layer` | — | **identical** |
-| `prefill_seconds` | 0.661 + 0.439 = 1.100 s | 1.048 s (one forward) |
+| Quantity | Result |
+|---|---|
+| batched prefill, run twice | bit-identical (`max abs delta = 0`) |
+| sequential prefill, run twice | bit-identical (`max abs delta = 0`) |
+| batched vs sequential, last real token's hidden state | `max abs delta = 0.016–0.0625` on `h` of magnitude 25–46, i.e. 0.5–2 fp16 ULP |
+| batched vs sequential, last real token's logits | `max abs delta = 0.0156–0.0186` on logits of magnitude ~17–18 (ULP ~ 0.0166) |
+| argmax at the prefill boundary, 8 requests (B=8) | **8/8 agree** |
+| greedy token sequences, B=8, 116 tokens | only 36.2% of positions agree; 2/8 slots differ from the first decoded token |
+| batched with `serial` vs `native` query backend | **8/8 identical** |
+| unify the LM-head GEMM shape, then re-compare | difference unchanged (ratio 1.004) |
 
-So the single batched forward leaves the same per-request KV and the same DCI
-trees as prefilling the prompts one at a time, and the decode that follows is
-unaffected. The wall-time figures are single observations on a shared GPU and are
-not a throughput claim: the padded `[2, 1040]` grid performs 2x1040 rows of
-projection/MLP work, so no scaling conclusion is drawn either way.
+So the two prefill modes are **numerically equivalent to about one fp16 ULP, not
+bit-identical**. The residual lives in the attention/KV path — the hidden states
+themselves differ by 0.5–2 ULP — and *not* in the LM-head GEMM shape (unifying
+that shape leaves the difference untouched). On the probe's synthetic word-salad
+prompts the next-token margin is as small as 0.0156, the same size as the 1-ULP
+difference, so greedy decoding amplifies it into token flips after one or two
+steps.
+
+Consequences: (a) token-exact equality is **not** a valid acceptance test for the
+batched prefill; the valid checks are per-path determinism, ULP-level logit
+agreement, argmax agreement at the prefill boundary, and identical per-request
+bookkeeping (`native_points_*`, `query_counts_by_layer`, page ownership) — all of
+which hold. (b) Any quality A/B that compares generated text must expect
+run-to-run divergence at fp16, or compare at logit level.
 
 **B = 3.** `--batch-size 3 --prefill-mode batched` also passed (prompt lengths
 1024 / 1040 / 1056, one prefill forward, `auto gpu_pages = 8192`): a single
@@ -413,10 +437,11 @@ by this work; the batched path is opt-in and defaults off.
 
 **Re-checked after the resource/workspace work.** `sequential` and `batched` runs
 at `--batch-size 2` (4+4+4 steps) both exit 0, report the same `workspace_bytes`
-(32 MiB) and the same `retire_gpu_pages_returned` (512), and produce **identical**
-`generated_token_ids`. A `--batch-size 4 --prefill-mode batched` run also passed:
-64 MiB workspace, 512 pages returned, `decode_steps = 12`, per-slot token counts
-`[4, 12, 12, 12]`.
+(32 MiB) and the same `retire_gpu_pages_returned` (512); their token sequences
+agreed in that particular run, which — per the numerical caveat above — is luck
+rather than a guarantee. A `--batch-size 4 --prefill-mode batched` run also
+passed: 64 MiB workspace, 512 pages returned, `decode_steps = 12`, per-slot token
+counts `[4, 12, 12, 12]`.
 
 **Thread release on retire.** With `InferState.shutdown()` wired into `retire`,
 the same runs report `loop_stopped=True` and the process thread count drops by 2
