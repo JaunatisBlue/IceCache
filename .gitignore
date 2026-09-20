@@ -4,3 +4,7 @@ __pycache__/
 IceCache/benchmark/passkey.jsonl
 IceCache/benchmark/pred/
 *.bak_*
+IceCache/benchmark/agent_cache/
+IceCache/source/build/
+IceCache/source/icecache/_mdci_batch.cpython-310-x86_64-linux-gnu.so
+code_ref/
