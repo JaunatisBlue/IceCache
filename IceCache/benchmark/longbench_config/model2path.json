@@ -12,5 +12,6 @@
     "llama-3-8b-inst-1048k": "gradientai/Llama-3-8B-Instruct-Gradient-1048k",
     "llama-3.1": "meta-llama/Llama-3.1-8B-Instruct",
     "qwen3": "Qwen/Qwen3-4B",
+    "qwen3-4b": "Qwen/Qwen3-4B",
     "qwen3-32b": "Qwen/Qwen3-32B"
 }

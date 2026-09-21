@@ -47,6 +47,14 @@ def parse_args(cmd_args=None):
     ap.add_argument("--ratio_2", type=float, default=0.2)
     ap.add_argument("--n_prefetch_layers", type=int, default=0)
     ap.add_argument("--n_reuse_layers", type=int, default=0)
+    ap.add_argument("--retrieval-backend", choices=["dci", "pag_mips", "page_scan"], default="dci")
+    ap.add_argument("--pag-ef-search", type=int, default=100)
+    ap.add_argument("--pag-max-search-k", type=int, default=128)
+    ap.add_argument("--pag-topm-initial-factor", type=int, default=4)
+    ap.add_argument("--pag-generation-reserve", type=int, default=4096)
+    ap.add_argument("--pag-ef-construction", type=int, default=200)
+    ap.add_argument("--pag-target-degree", type=int, default=16)
+    ap.add_argument("--pag-projection-levels", type=int, default=64)
     ap.add_argument(
         "--datasets",
         nargs="+",
