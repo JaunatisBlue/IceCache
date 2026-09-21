@@ -40,6 +40,9 @@ def arguments():
     parser.add_argument("--page-scan-batch", type=int, default=1, choices=[0, 1],
                         help="1 = one batched page build at end of prefill "
                              "(default, ~4.3x faster); 0 = one greedy per layer")
+    parser.add_argument("--page-scan-write-threads", type=int, default=8,
+                        help="Threads for the deferred CPU page writes "
+                             "(default 8, ~5x on that loop); 1 = serial")
     parser.add_argument("--n-reuse-layers", type=int, default=0,
                         help="Match run_longbench.sh production config by passing 3")
     parser.add_argument("--seed", type=int, default=42)
@@ -229,7 +232,8 @@ def run_backend(args, backend, samples, tokenizer, device, max_new_tokens, outpu
         pag_ef_construction=args.pag_ef_construction,
         pag_target_degree=args.pag_target_degree,
         pag_projection_levels=args.pag_projection_levels,
-        page_scan_batch=bool(args.page_scan_batch))
+        page_scan_batch=bool(args.page_scan_batch),
+        page_scan_write_threads=args.page_scan_write_threads)
     adapter.enable_icecache(model, dtype=torch.float16, device=device, infer_state=state)
 
     if args.inject_pages != "off":

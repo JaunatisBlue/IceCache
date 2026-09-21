@@ -87,6 +87,11 @@ class InferState:
         # _page_scan_flush). Off reproduces the per-layer behaviour, for A/B
         # timing in one process or as an escape hatch.
         page_scan_batch=True,
+        # Threads for the deferred CPU page writes in _page_scan_flush. They are
+        # independent per layer and numpy drops the GIL for the copy, so they
+        # overlap: 5.2x on 8 threads against 2.77 GB/s serial. <=1 keeps the
+        # serial loop, for A/B and as an escape hatch.
+        page_scan_write_threads=8,
         **kwargs,
     ) -> None:
         self.n_layers = n_layers
@@ -116,6 +121,12 @@ class InferState:
         self.retrieval_backend = retrieval_backend
         self.page_scan_generation_reserve = page_scan_generation_reserve
         self.page_scan_batch = bool(page_scan_batch)
+        self.page_scan_write_threads = int(page_scan_write_threads)
+        if self.page_scan_write_threads < 0:
+            raise ValueError("Invalid page_scan_write_threads")
+        # Lazily built: most runs never offload anything, and a pool per
+        # InferState is cheap but not free.
+        self._page_scan_write_pool = None
         self.pag_config = (pag_generation_reserve, pag_max_search_k,
                            pag_ef_search, pag_topm_initial_factor,
                            pag_ef_construction, pag_target_degree, pag_projection_levels)
@@ -696,10 +707,15 @@ class InferState:
             [kvc.batch_size, self.n_kv_heads, self.kvc_capacity[cur_id]], -1, dtype=np.uintp)
 
         offset = self.page_size * self.head_dim * self.cpu_dtype.itemsize
+        # One vector add per head, not n_reserved: the address of page j for head
+        # i is just base + i*offset + j*stride, so the whole row is one numpy
+        # add. Building it as a Python list of ctypes ints instead measured
+        # 425 ms/row of TTFT (68 calls, ~10k ctypes calls each) for identical
+        # values.
+        page_strides = np.arange(n_reserved, dtype=np.uintp) * np.uintp(stride)
         for i in range(self.n_kv_heads):
-            base = _base + i * offset
-            tmp_addr = [cast(base + j * stride, c_void_p).value for j in range(n_reserved)]
-            self.page_address_buffer[cur_id][b, i, :n_reserved] = np.array(tmp_addr, dtype=np.uintp)
+            self.page_address_buffer[cur_id][b, i, :n_reserved] = (
+                np.uintp(_base + i * offset) + page_strides)
         return _base
 
     def _page_scan_first_call(self, b, cur_id, key_states, value_states):
@@ -801,9 +817,27 @@ class InferState:
         # Writes run after every partition exists, so the reuse layers -- which
         # write their own K/V at their source's (page, slot) -- read a partition
         # that is already complete.
-        for b, cur_id, k, v, reuse_id in pending:
-            scan = self.page_scans[cur_id if reuse_id == 0 else reuse_id]
-            self._page_scan_write(b, cur_id, scan.token2page, scan.offset_in_page, k, v)
+        #
+        # They are independent -- each entry fills its own layer's CPU pool at a
+        # partition that is already final -- and numpy releases the GIL for the
+        # copy, so they run on a small pool. Serial this loop sustains only
+        # 2.77 GB/s (it is a scattered 4-D fancy-index store, not a memcpy) and
+        # cost 1070 ms/row of TTFT; 8 threads measured 5.2x on the same work.
+        if self.page_scan_write_threads > 1 and len(pending) > 1:
+            if self._page_scan_write_pool is None:
+                self._page_scan_write_pool = ThreadPoolExecutor(
+                    max_workers=min(self.page_scan_write_threads, len(pending)))
+            # list() so an exception in a worker surfaces here, not at GC.
+            list(self._page_scan_write_pool.map(self._page_scan_write_entry, pending))
+        else:
+            for entry in pending:
+                self._page_scan_write_entry(entry)
+
+    def _page_scan_write_entry(self, entry):
+        """Write one stashed layer's K/V into its CPU pages (flush worker body)."""
+        b, cur_id, k, v, reuse_id = entry
+        scan = self.page_scans[cur_id if reuse_id == 0 else reuse_id]
+        self._page_scan_write(b, cur_id, scan.token2page, scan.offset_in_page, k, v)
 
     def _page_scan_add(self, b, cur_id, key_states, value_states):
         """Design A decode insert (mirrors DCI's reuse gating exactly, spec 6b C4)."""
