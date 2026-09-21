@@ -308,8 +308,12 @@ def _greedy_packed_pages_live(k, page_size, span=None):
     assigned are read, scored, and thrown away; only the live columns are
     candidates. Scanning the live keys instead halves the reads, and it is
     exact: a gemv accumulates ``sum_d A[d, n] * x[d]`` independently per column
-    ``n``, so removing columns cannot move a bit of the columns that stay (this
-    is checked against the full-row bmm, ties included, in REPORT.md).
+    ``n``, so removing columns cannot move a bit of the columns that stay -- but
+    only for a kernel whose per-column accumulator does not depend on the
+    operand shape. That is true of the CUDA kernel this runs on (measured:
+    ``bmm(s, k_live^T)`` reproduces the full row's columns exactly, 0 of 1542912
+    entries at L from 16072 down to 16) and false of CPU BLAS, which is why the
+    dispatch in `greedy_packed_pages` is CUDA-only.
 
     Rebuilding the live set is a gather of ``L`` keys (read + write == two
     scans), so it is amortised over a *span* of pages instead of done per page.
