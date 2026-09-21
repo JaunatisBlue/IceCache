@@ -264,6 +264,18 @@ class PageScan:
 
     # ------------------------------------------------------------------ build
 
+    def reserve_address_space(self, n_tokens):
+        """Fix and return ``n_pages`` for ``n_tokens``, before any greedy runs.
+
+        The reserved space depends only on the token count, never on the greedy,
+        so a caller can lay a layer out -- ``infer_state._page_scan_layout``,
+        which truncates ``kvc.c2p`` that ``prefill_sdpa`` reads straight after --
+        while deferring the greedy that fills the same space. ``build`` and
+        ``build_from_packed`` take the result back through ``n_reserved``.
+        """
+        self.n_pages = -(-int(n_tokens) // self.page_size) + self.reserve_pages
+        return self.n_pages
+
     def build(self, keys, n_reserved=None):
         """Greedy pack ``keys`` into pages of ``page_size`` (spec section 2).
 
@@ -284,7 +296,7 @@ class PageScan:
             raise PageScanError("build requires at least one token")
         n_built = -(-N // P)
         if n_reserved is None:
-            n_reserved = n_built + self.reserve_pages
+            n_reserved = self.reserve_address_space(N)
         if n_reserved < n_built:
             raise PageScanError(
                 f"n_reserved={n_reserved} cannot hold the {n_built} built pages")
@@ -318,7 +330,7 @@ class PageScan:
             raise PageScanError("build requires at least one token")
         n_built = -(-N // self.page_size)
         if n_reserved is None:
-            n_reserved = n_built + self.reserve_pages
+            n_reserved = self.reserve_address_space(N)
         if n_reserved < n_built:
             raise PageScanError(
                 f"n_reserved={n_reserved} cannot hold the {n_built} built pages")

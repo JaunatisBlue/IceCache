@@ -17,7 +17,7 @@ import icecache_cpp as _cpp
 import numpy as np
 from time import time, perf_counter
 from dciknn import DCI
-from .page_scan import PageScan
+from .page_scan import PageScan, greedy_packed_pages
 from .pag_retrieval import InsufficientPagesError
 from tqdm import tqdm
 import copy
@@ -82,6 +82,11 @@ class InferState:
         # refuses *before* mutating, and a too-small declaration is rejected
         # here, at construction, rather than mid-generation.
         page_scan_generation_reserve=4096,
+        # Batch every layer's page build into one greedy at the end of prefill
+        # instead of one greedy per layer (~4.3x on a 16k prompt; see
+        # _page_scan_flush). Off reproduces the per-layer behaviour, for A/B
+        # timing in one process or as an escape hatch.
+        page_scan_batch=True,
         **kwargs,
     ) -> None:
         self.n_layers = n_layers
@@ -110,6 +115,7 @@ class InferState:
                 f"({page_size} decode tokens), got {page_scan_generation_reserve}")
         self.retrieval_backend = retrieval_backend
         self.page_scan_generation_reserve = page_scan_generation_reserve
+        self.page_scan_batch = bool(page_scan_batch)
         self.pag_config = (pag_generation_reserve, pag_max_search_k,
                            pag_ef_search, pag_topm_initial_factor,
                            pag_ef_construction, pag_target_degree, pag_projection_levels)
@@ -117,6 +123,10 @@ class InferState:
         self.pag_disabled = set()
         self.pag_fallback_count = 0
         self.page_scans = [None] * n_layers
+        # (b, layer, K, V, reuse_id) stashed during prefill by
+        # _page_scan_first_call; the greedy and the CPU page write run as one
+        # batch in _page_scan_flush. See that method for why they are deferred.
+        self._page_scan_deferred = []
         self.query_seconds = {"dci": [], "pag_mips": [], "page_scan": []}
         self._pag_pool = None
         self._ensure_pag_pool()
@@ -358,6 +368,7 @@ class InferState:
         self.prefill_evicted_pages = [None] * self.n_layers
         self.selected_page_idx = [None] * self.n_layers
         self.page_scans = [None] * self.n_layers
+        self._page_scan_deferred = []
         self.kv_caches = [None] * self.n_layers
         self.cpu_kv_caches = [None] * self.n_layers
         self.temp_cpu_kv_caches = [None] * self.n_layers
@@ -500,6 +511,7 @@ class InferState:
             self.pag_disabled.clear()
             self.pag_fallback_count = 0
             self.page_scans = [None] * self.n_layers
+            self._page_scan_deferred = []
             self.query_seconds = {"dci": [], "pag_mips": [], "page_scan": []}
             # page_scan builds its own structure in _DCI_first_call; the DCI
             # tree is not allocated at all for that backend.
@@ -540,6 +552,10 @@ class InferState:
             raise
 
     def _finish_prefill(self, bsz, q_len):
+        # Before offloading below, and long before the first decode token reads a
+        # page: pack every layer stashed by _page_scan_first_call in one batch.
+        if self.retrieval_backend == "page_scan":
+            self._page_scan_flush()
         for b, ls in self.budget2layers.items():
             n_kv_pages = utils.all_eq(
                 self.kv_caches[l].n_real_pages for l in ls)
@@ -687,9 +703,23 @@ class InferState:
         return _base
 
     def _page_scan_first_call(self, b, cur_id, key_states, value_states):
-        """Design A prefill: greedy page build + the layer's CPU page layout."""
+        """Design A prefill: the layer's CPU page layout, and a deferred build.
+
+        The *layout* runs here and cannot move: it truncates ``kvc.c2p`` to
+        sink+window, and ``prefill_sdpa`` reads ``kvc.c2p`` for this layer
+        immediately after this call (``modeling.py:150``, with ``page_ids=None``).
+        Deferring it would feed every later layer an untruncated ``c2p`` and
+        silently change attention.
+
+        The *greedy* and the CPU page write are deferred to
+        :meth:`_page_scan_flush`, which runs them for every layer as one batch.
+        Nothing in the prefill forward reads a page partition or the CPU pages it
+        fills -- the first reader is decode-time ``_page_scan_add``.
+        """
         H = self.n_kv_heads
         reuse_id = self.check_reuse(cur_id)
+        k = key_states.reshape(H, -1, self.head_dim)
+        v = value_states.reshape(H, -1, self.head_dim)
         if reuse_id == 0:
             # n_pages_reserved, not n_pages_built: the extra pages are address
             # space for decode-time page emission (spec section 6b, C1). The
@@ -698,12 +728,8 @@ class InferState:
             # hold -- D2's loud failure, before a single decode token is served.
             scan = PageScan(H, self.head_dim, self.page_size, device=self.device,
                             generation_reserve_tokens=self.page_scan_generation_reserve)
-            scan.build(key_states)
             self.page_scans[cur_id] = scan
-            self._page_scan_layout(b, cur_id, scan.n_pages)
-            self._page_scan_write(b, cur_id, scan.token2page, scan.offset_in_page,
-                                  key_states.reshape(H, -1, self.head_dim),
-                                  value_states.reshape(H, -1, self.head_dim))
+            self._page_scan_layout(b, cur_id, scan.reserve_address_space(k.shape[1]))
         else:
             # A reuse layer aliases the source's partition and lays its own K/V
             # out the same way; it must not build (spec section 5, hazard 5).
@@ -716,9 +742,68 @@ class InferState:
                 tmp_addr = self.page_address_buffer[reuse_id][b, i, :scan.n_pages] + layer_offset
                 self.page_address_buffer[cur_id][b, i, :scan.n_pages] = np.array(
                     tmp_addr, dtype=np.uintp)
-            self._page_scan_write(b, cur_id, scan.token2page, scan.offset_in_page,
-                                  key_states.reshape(H, -1, self.head_dim),
-                                  value_states.reshape(H, -1, self.head_dim))
+        # clone(): the source is a temp_cpu_kv_cache that its caller frees as soon
+        # as this returns (infer_state.py:1434), but the write waits for the flush.
+        self._page_scan_deferred.append((b, cur_id, k.clone(), v.clone(), reuse_id))
+        if not self.page_scan_batch:
+            # One layer per flush: the pre-batching behaviour. Kept switchable so
+            # the TTFT delta can be measured against it in the same process, and
+            # so a batch that ever misbehaved has a way out. Both paths use the
+            # same greedy (use_sim=False), which isolates batching itself.
+            self._page_scan_flush()
+
+    def _page_scan_flush(self):
+        """Run every deferred greedy as ONE batch, then write each layer's pages.
+
+        This is the whole TTFT fix. The greedy's per-page ops (``argmax``,
+        ``masked_fill``, ``topk``, both scatters) are launch-latency-bound, not
+        throughput-bound: taking the head count from 8 to 96 costs 1.04x in
+        total, i.e. 0.09x per head. So packing all 12 builder layers' 96 heads in
+        a single call costs about what packing one layer costs, and the build
+        goes from 3408 ms to 798 ms on a 16k prompt -- essentially the entire
+        TTFT gap against DCI (3.0 s).
+
+        Batching is bit-exact against per-layer builds: every op in the loop is
+        row-independent, and measured on real keys packing 16 heads at once vs
+        8+8 gave 0/188320 differing entries.
+        """
+        pending = self._page_scan_deferred
+        if not pending:
+            return
+        self._page_scan_deferred = []
+        H = self.n_kv_heads
+        builders = [i for i, p in enumerate(pending) if p[4] == 0]
+        if builders:
+            # One greedy for every builder layer. use_sim=False because the
+            # materialised [M, N, N] similarity would be 99 GB at 96 heads; the
+            # row-on-demand path is still 4.27x ahead of building them serially.
+            #
+            # One greedy packs them all at a shared token count, so unequal
+            # lengths would silently mis-slice the result. Every layer offloads
+            # the same prompt under the same budget, so this holds -- but assert
+            # it rather than trust it, since the failure is a wrong partition,
+            # not a crash.
+            lengths = {int(pending[i][2].shape[1]) for i in builders}
+            if len(lengths) != 1:
+                raise RuntimeError(
+                    f"page_scan batch needs one token count across layers, got {sorted(lengths)}")
+            keys = torch.cat([pending[i][2] for i in builders], dim=0).to(self.device)
+            packed = greedy_packed_pages(keys, self.page_size, use_sim=False)
+            for n, i in enumerate(builders):
+                cur_id = pending[i][1]
+                scan = self.page_scans[cur_id]
+                # The GPU slice goes back in so the keys are not sent over PCIe
+                # a second time; the CPU copy stays for the write below.
+                scan.build_from_packed(
+                    packed[n * H:(n + 1) * H], keys[n * H:(n + 1) * H],
+                    n_reserved=scan.n_pages)
+            del keys, packed
+        # Writes run after every partition exists, so the reuse layers -- which
+        # write their own K/V at their source's (page, slot) -- read a partition
+        # that is already complete.
+        for b, cur_id, k, v, reuse_id in pending:
+            scan = self.page_scans[cur_id if reuse_id == 0 else reuse_id]
+            self._page_scan_write(b, cur_id, scan.token2page, scan.offset_in_page, k, v)
 
     def _page_scan_add(self, b, cur_id, key_states, value_states):
         """Design A decode insert (mirrors DCI's reuse gating exactly, spec 6b C4)."""
