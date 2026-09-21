@@ -151,14 +151,29 @@ def greedy_packed_pages(k, page_size, use_sim=True):
     builds 4.27x, because every other op in the loop is launch-latency-bound and
     costs the same at M=8 as at M=96 (316 ms/layer -> 66 ms/layer).
 
-    ``use_sim=False`` is served by :func:`_greedy_packed_pages_live`, which
-    updates the row scan to read only the tokens that can still be chosen and is
-    required to be output-identical to :func:`_greedy_packed_pages_rescan` (the
-    batched loop as it stood before, kept here as the reference the self-test
-    holds the live path to).
+    ``use_sim=False`` on CUDA is served by :func:`_greedy_packed_pages_live`,
+    which updates the row scan to read only the tokens that can still be chosen
+    and is required to be output-identical to :func:`_greedy_packed_pages_rescan`
+    (the batched loop as it stood before, kept here as the reference the
+    self-test holds the live path to).
+
+    On CPU the live path is *not* taken. Its bit-identity rests on one property
+    of the row gemv -- that the accumulator for a column does not depend on which
+    other columns are in the operand -- which the production CUDA kernel has (one
+    thread per column, a fixed loop over ``D``) but CPU BLAS does not: blocking
+    is chosen from the operand shape, so a compacted scan rounds differently.
+    Measured on the fuzz case that first exposed it (M=5, N=584, P=9, D=14, the
+    page whose live set has L=403 columns): gathering those exact columns out of
+    the full ``bmm`` row and recomputing them against the compacted operand gives
+    6 of 2015 entries off by one ULP (max relative error 1.0e-07), and 1275 of
+    2015 when the transposed operand is materialised instead of strided -- enough
+    to flip a tied ``topk``. Not a bookkeeping bug: same column set, same order,
+    same seed, gathered from the full row. So CPU keeps the full-width rescan and
+    pays the old cost.
     """
     if not use_sim:
-        return _greedy_packed_pages_live(k, page_size)
+        return (_greedy_packed_pages_live(k, page_size) if k.is_cuda
+                else _greedy_packed_pages_rescan(k, page_size))
     M, N, _ = k.shape
     n_built = -(-N // page_size)
     heads = torch.arange(M, device=k.device)
@@ -1372,13 +1387,18 @@ def _self_test():
         k = torch.ones((2, 64, 8), dtype=torch.float32, device=device)
         yield "M=2 N=64 P=8 all keys equal", k, 8
 
+    # On CPU the live path is not the one that runs (see `greedy_packed_pages`:
+    # CPU BLAS does not keep a column's accumulator independent of the operand
+    # shape), so what is checked here is the public entry point -- which must
+    # still hand back the shipped loop's bytes.
     for label, k, P in _greedy_cases("cpu"):
         want = _greedy_packed_pages_rescan(k, P)
-        for span in (1, 2, 7, 1000):
-            got = _greedy_packed_pages_live(k, P, span=span)
-            check(f"batched greedy bit-identical, {label}, span={span}",
-                  torch.equal(got, want),
-                  f"{int((got != want).sum())}/{got.numel()} entries differ")
+        got = greedy_packed_pages(k, P, use_sim=False)
+        check(f"batched greedy bit-identical (cpu), {label}",
+              torch.equal(got, want),
+              f"{int((got != want).sum())}/{got.numel()} entries differ")
+    # On CUDA the live path is the one that runs, so it is held to the reference
+    # directly, at several spans, on the tie cases above.
     if torch.cuda.is_available():
         for label, k, P in _greedy_cases("cuda:0"):
             want = _greedy_packed_pages_rescan(k, P)
@@ -1387,6 +1407,9 @@ def _self_test():
                 check(f"batched greedy bit-identical (cuda), {label}, span={span}",
                       torch.equal(got, want),
                       f"{int((got != want).sum())}/{got.numel()} entries differ")
+            check(f"batched greedy bit-identical (cuda dispatch), {label}",
+                  torch.equal(greedy_packed_pages(k, P, use_sim=False), want),
+                  "dispatch did not reach the live path")
 
     print(f"\n{'ALL PASS' if not failures else 'FAILURES: ' + ', '.join(failures)}")
     return 1 if failures else 0
