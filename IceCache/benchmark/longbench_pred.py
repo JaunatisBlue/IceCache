@@ -31,6 +31,10 @@ def parse_args(cmd_args=None):
         ],
     )
     ap.add_argument("--name", type=str, default="default")
+    ap.add_argument("--model-path", type=str,
+                    help="Override longbench_config/model2path.json")
+    ap.add_argument("--max-samples", type=int, default=0,
+                    help="Run only the first N rows of each dataset; 0 means all")
     ap.add_argument("--e", action="store_true", help="Evaluate on LongBench-E")
     ap.add_argument("--icecache", action="store_true", help="Enable IceCache")
     ap.add_argument("--page-size", type=int, default=16)
@@ -86,6 +90,8 @@ def parse_args(cmd_args=None):
     args.e = False
     if args.page_budgets < 0:
         args.page_budgets = None
+    if args.max_samples < 0:
+        ap.error("--max-samples must be nonnegative")
     return args
 
 
@@ -336,7 +342,7 @@ if __name__ == "__main__":
     # define your model
     max_length = model2maxlen[model_name]
     model, tokenizer = load_model_and_tokenizer(
-        model2path[model_name], model_name, device, args
+        args.model_path or model2path[model_name], model_name, device, args
     )
 
     datasets = args.datasets
@@ -356,10 +362,13 @@ if __name__ == "__main__":
         prompt_format = dataset2prompt[dataset]
         max_gen = dataset2maxlen[dataset]
 
+        rows = list(data)
+        if args.max_samples:
+            rows = rows[:args.max_samples]
         get_pred(
             model,
             tokenizer,
-            list(data),
+            rows,
             max_length,
             max_gen,
             prompt_format,
