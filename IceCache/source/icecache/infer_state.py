@@ -15,8 +15,10 @@ from . import utils
 import icecache_cpp as _cpp
 
 import numpy as np
-from time import time
+from time import time, perf_counter
 from dciknn import DCI
+from .page_scan import PageScan
+from .pag_retrieval import InsufficientPagesError
 from tqdm import tqdm
 import copy
 from ctypes import c_float, POINTER, cast, c_void_p
@@ -55,6 +57,31 @@ class InferState:
         debug=False,
         ratio_1=0.01,
         ratio_2=0.2,
+        retrieval_backend="dci",
+        pag_ef_search=100,
+        # PAG build cost is ~linear in max_search_k: measured 4.3 s @128 vs
+        # 58.0 s @1024 per (layer, KV head) at N=16000 with no page-recall gain,
+        # so 128 is the default.
+        pag_max_search_k=128,
+        pag_topm_initial_factor=4,
+        pag_generation_reserve=4096,
+        pag_ef_construction=200,
+        pag_target_degree=16,
+        pag_projection_levels=64,
+        # Design A reserves the page-id space for decode up front (spec 6b, C1):
+        # the CPU addresses are allocated at prefill and never grow, which is
+        # what keeps the one-shot contiguity assert in _DCI_first_call true.
+        #
+        # page_scan_generation_reserve is the decode budget that reservation
+        # must hold, in tokens per KV head. `PageScan` turns it into
+        # `ceil(tokens / page_size) + DEFAULT_RESERVE_MARGIN_PAGES` pages -- the
+        # margin is deliberate (D2): an earlier deployment reserved exactly
+        # `ceil(4096 / 16) = 256` pages, so a generation of 4097 tokens died on
+        # the flush that needed the 257th page. The pages are a hard cap: past
+        # them `PageScan.insert` can only refuse the flush, it cannot grow. It
+        # refuses *before* mutating, and a too-small declaration is rejected
+        # here, at construction, rather than mid-generation.
+        page_scan_generation_reserve=4096,
         **kwargs,
     ) -> None:
         self.n_layers = n_layers
@@ -65,6 +92,34 @@ class InferState:
         self.head_dim = head_dim
         self.ratio_1 = ratio_1
         self.ratio_2 = ratio_2
+        if retrieval_backend not in ("dci", "pag_mips", "page_scan"):
+            raise ValueError(f"Unknown retrieval backend: {retrieval_backend}")
+        if (pag_generation_reserve < 0 or pag_max_search_k <= 0 or
+                pag_ef_search <= 0 or pag_topm_initial_factor <= 0 or
+                pag_ef_construction <= 0 or pag_target_degree <= 0 or
+                pag_projection_levels <= 0 or pag_projection_levels % 8):
+            raise ValueError("Invalid PAG search or capacity configuration")
+        if page_scan_generation_reserve < 0:
+            raise ValueError("Invalid page_scan generation reserve")
+        if retrieval_backend == "page_scan" and page_scan_generation_reserve < page_size:
+            # D2: a sub-page (or zero) declaration cannot serve a decode step --
+            # with the old code it survived construction and died on the first
+            # flush that ran out of page-id space.
+            raise ValueError(
+                "page_scan_generation_reserve must be at least one page "
+                f"({page_size} decode tokens), got {page_scan_generation_reserve}")
+        self.retrieval_backend = retrieval_backend
+        self.page_scan_generation_reserve = page_scan_generation_reserve
+        self.pag_config = (pag_generation_reserve, pag_max_search_k,
+                           pag_ef_search, pag_topm_initial_factor,
+                           pag_ef_construction, pag_target_degree, pag_projection_levels)
+        self.pag_selectors = [None] * n_layers
+        self.pag_disabled = set()
+        self.pag_fallback_count = 0
+        self.page_scans = [None] * n_layers
+        self.query_seconds = {"dci": [], "pag_mips": [], "page_scan": []}
+        self._pag_pool = None
+        self._ensure_pag_pool()
 
         self.dtype = dtype
         self.device = device
@@ -273,6 +328,26 @@ class InferState:
         else:
             return cur_id-position_in_cycle
 
+    def _ensure_pag_pool(self):
+        """Return the one shared PAG pool, creating it on first use.
+
+        Every layer's PagPageSelector shares this pool: pag.Index.search
+        releases the GIL so the per-head searches overlap, while
+        pag.Index.build holds it so index construction stays serial.
+        """
+        if self.retrieval_backend != "pag_mips":
+            return None
+        if self._pag_pool is None:
+            self._pag_pool = ThreadPoolExecutor(max_workers=self.n_kv_heads)
+        return self._pag_pool
+
+    def _close_pag_pool(self):
+        """Retire the shared PAG pool. Safe to call repeatedly."""
+        pool = self._pag_pool
+        if pool is not None:
+            self._pag_pool = None
+            pool.shutdown(wait=True)
+
     def _prepare_prefill(self, bsz, q_len):
         self.num_offload_pages = None
         self.n_dci_pages = None
@@ -282,6 +357,7 @@ class InferState:
         self.prefill_backup_events = [None] * self.n_layers
         self.prefill_evicted_pages = [None] * self.n_layers
         self.selected_page_idx = [None] * self.n_layers
+        self.page_scans = [None] * self.n_layers
         self.kv_caches = [None] * self.n_layers
         self.cpu_kv_caches = [None] * self.n_layers
         self.temp_cpu_kv_caches = [None] * self.n_layers
@@ -412,9 +488,25 @@ class InferState:
             proj_vec = self.proj_vec.detach().cpu().numpy().astype(np.float32)
 
             self.dci_db = [None] * self.n_layers
-            for i in range(self.n_layers):
-                if self.layer2budget[i] and self.check_reuse(i) == 0:
-                    self.dci_db[i] = DCI(self.head_dim, 1, 1, promotion_prob=self.ratio_1, promotion_prob_subseq=self.ratio_2, num_points=q_len, init=True, num_inst=self.n_kv_heads, debug=self.debug, transform=True, parallel_level=self.parallel_level, proj_vec=proj_vec)
+            # A new prompt starts here, so the previous prompt's selectors are
+            # done (PAG queries run synchronously on the calling thread) and the
+            # shared pool holds no in-flight work. Retire it; the next prefill
+            # recreates it lazily in _DCI_first_call.
+            self._close_pag_pool()
+            for selector in self.pag_selectors:
+                if selector is not None:
+                    selector.close()
+            self.pag_selectors = [None] * self.n_layers
+            self.pag_disabled.clear()
+            self.pag_fallback_count = 0
+            self.page_scans = [None] * self.n_layers
+            self.query_seconds = {"dci": [], "pag_mips": [], "page_scan": []}
+            # page_scan builds its own structure in _DCI_first_call; the DCI
+            # tree is not allocated at all for that backend.
+            if self.retrieval_backend != "page_scan":
+                for i in range(self.n_layers):
+                    if self.layer2budget[i] and self.check_reuse(i) == 0:
+                        self.dci_db[i] = DCI(self.head_dim, 1, 1, promotion_prob=self.ratio_1, promotion_prob_subseq=self.ratio_2, num_points=q_len, init=True, num_inst=self.n_kv_heads, debug=self.debug, transform=True, parallel_level=self.parallel_level, proj_vec=proj_vec)
 
         qo_indptr = torch.arange(0, bsz * q_len + 1, q_len, **self._i32)
         self.prefill_handler.begin_forward(
@@ -533,6 +625,126 @@ class InferState:
         else:
             self._finish_decode(bsz)
 
+    # ------------------------------------------------------- page_scan (Design A)
+    #
+    # page_scan replaces DCI's tree build and tree retrieval with exact-kNN page
+    # packing plus one matmul over page representatives (experiment/design_a_spec.md).
+    # Everything below is gated on retrieval_backend == "page_scan"; the DCI path
+    # above is untouched and stays runnable as the baseline arm.
+
+    def _page_scan_write(self, b, cur_id, pages, slots, key_states, value_states):
+        """Write one layer's own K/V into its CPU pages at ``(page, slot)``.
+
+        ``pages``/``slots`` are ``int32 [H, m]``; the payloads are ``float32
+        [H, m, head_dim]``. The CPU pages were allocated contiguously and never
+        move (spec section 7, hazard 1), so page ``p``'s K plane for head ``h``
+        lives at ``region[p, 0, h]`` of the frame allocated at prefill.
+        """
+        cpu_cache = self.cpu_kv_caches[cur_id]
+        base = int(cpu_cache.c2p[b, 0])
+        region = cpu_cache.pool.buffer.numpy()[base:]
+        heads = np.arange(self.n_kv_heads)[:, None]
+        region[pages, 0, heads, slots] = np.asarray(key_states)
+        region[pages, 1, heads, slots] = np.asarray(value_states)
+
+    def _page_scan_layout(self, b, cur_id, n_reserved):
+        """Reserve the GPU-side bookkeeping for ``cur_id`` (mirrors DCI's part).
+
+        Returns the CPU base address of the layer's page frame. All ``n_reserved``
+        pages are allocated and addressed now, so a page emitted at decode already
+        has a valid CPU address (spec section 6b, C1).
+        """
+        stride = self.cpu_n_bytes_per_page
+        cpu_cache = self.cpu_kv_caches[cur_id]
+        kvc = self.kv_caches[cur_id]
+        cpu_cache.prefill_alloc_n_tokens(n_reserved * self.page_size)
+        _base = cpu_cache[b, 0].data_ptr()
+        assert cpu_cache[b, -1].data_ptr() - _base == (n_reserved - 1) * stride
+
+        # For offloading (unchanged from DCI)
+        ns = kvc.n_sink_pages
+        ev_gpi = kvc.c2p.clone()
+        ev_gpi[:, :ns] = -1
+        ev_gpi[:, -kvc.budget + ns:] = -1
+        self.prefill_evicted_pages[cur_id] = ev_gpi
+
+        kvc.c2p = torch.cat(
+            [kvc.c2p[:, :ns], kvc.c2p[:, -kvc.budget + ns:]], dim=-1)
+
+        self.kvc_capacity[cur_id] = 1 << (int(n_reserved) - 1).bit_length()
+        kvc.cc2gp = torch.full(
+            [kvc.batch_size, self.n_kv_heads, self.kvc_capacity[cur_id]], -1, **self._ci32)
+        kvc.ccc = torch.ones(
+            [kvc.batch_size, self.n_kv_heads, self.kvc_capacity[cur_id]], **self._cb)
+        self.page_address_buffer[cur_id] = np.full(
+            [kvc.batch_size, self.n_kv_heads, self.kvc_capacity[cur_id]], -1, dtype=np.uintp)
+
+        offset = self.page_size * self.head_dim * self.cpu_dtype.itemsize
+        for i in range(self.n_kv_heads):
+            base = _base + i * offset
+            tmp_addr = [cast(base + j * stride, c_void_p).value for j in range(n_reserved)]
+            self.page_address_buffer[cur_id][b, i, :n_reserved] = np.array(tmp_addr, dtype=np.uintp)
+        return _base
+
+    def _page_scan_first_call(self, b, cur_id, key_states, value_states):
+        """Design A prefill: greedy page build + the layer's CPU page layout."""
+        H = self.n_kv_heads
+        reuse_id = self.check_reuse(cur_id)
+        if reuse_id == 0:
+            # n_pages_reserved, not n_pages_built: the extra pages are address
+            # space for decode-time page emission (spec section 6b, C1). The
+            # count comes from the declared generation budget plus PageScan's
+            # margin, and PageScan refuses a declaration its reservation cannot
+            # hold -- D2's loud failure, before a single decode token is served.
+            scan = PageScan(H, self.head_dim, self.page_size, device=self.device,
+                            generation_reserve_tokens=self.page_scan_generation_reserve)
+            scan.build(key_states)
+            self.page_scans[cur_id] = scan
+            self._page_scan_layout(b, cur_id, scan.n_pages)
+            self._page_scan_write(b, cur_id, scan.token2page, scan.offset_in_page,
+                                  key_states.reshape(H, -1, self.head_dim),
+                                  value_states.reshape(H, -1, self.head_dim))
+        else:
+            # A reuse layer aliases the source's partition and lays its own K/V
+            # out the same way; it must not build (spec section 5, hazard 5).
+            scan = self.page_scans[reuse_id]
+            if scan is None:
+                raise RuntimeError(f"page_scan source layer {reuse_id} has no structure")
+            _base = self._page_scan_layout(b, cur_id, scan.n_pages)
+            layer_offset = _base - self.cpu_kv_caches[reuse_id][b, 0].data_ptr()
+            for i in range(self.n_kv_heads):
+                tmp_addr = self.page_address_buffer[reuse_id][b, i, :scan.n_pages] + layer_offset
+                self.page_address_buffer[cur_id][b, i, :scan.n_pages] = np.array(
+                    tmp_addr, dtype=np.uintp)
+            self._page_scan_write(b, cur_id, scan.token2page, scan.offset_in_page,
+                                  key_states.reshape(H, -1, self.head_dim),
+                                  value_states.reshape(H, -1, self.head_dim))
+
+    def _page_scan_add(self, b, cur_id, key_states, value_states):
+        """Design A decode insert (mirrors DCI's reuse gating exactly, spec 6b C4)."""
+        H = self.n_kv_heads
+        m = key_states.shape[1]
+        k_np = key_states.reshape(H, m, self.head_dim).float().numpy()
+        v_np = value_states.reshape(H, m, self.head_dim).float().numpy()
+        reuse_id = self.check_reuse(cur_id)
+        if reuse_id == 0:
+            scan = self.page_scans[cur_id]
+            if scan is None:
+                raise RuntimeError(f"page_scan layer {cur_id} has no structure")
+            pages, slots = scan.insert(k_np)
+            # Pages that gained tokens are stale in the GPU copy and must be
+            # re-recalled if selected (DCI's changed_page_list).
+            kvc = self.kv_caches[cur_id]
+            kvc.ccc[b, torch.arange(H).unsqueeze(1), torch.as_tensor(pages)] = True
+        else:
+            # The reuse layer reads the source's assignment instead of computing
+            # its own: its keys differ, so recomputing would silently diverge.
+            scan = self.page_scans[reuse_id]
+            if scan is None or scan.last_insert is None:
+                raise RuntimeError(f"page_scan source layer {reuse_id} has not inserted")
+            pages, slots = scan.last_insert
+        self._page_scan_write(b, cur_id, pages, slots, k_np, v_np)
+
     def _DCI_first_call(self, b, cur_id, query_states, key_states, value_states, projected):
         #######   DCI Inst Construction   #######
         if self.use_dci:
@@ -547,6 +759,10 @@ class InferState:
             assert (_query_states.flags['C_CONTIGUOUS'])
             assert (_key_states.flags['C_CONTIGUOUS'])
             assert (_value_states.flags['C_CONTIGUOUS'])
+
+            if self.retrieval_backend == "page_scan":
+                self._page_scan_first_call(b, cur_id, key_states, value_states)
+                return
 
             if self.check_reuse(cur_id) == 0:
 
@@ -645,6 +861,16 @@ class InferState:
                 page_indices = np.array(np.tile(np.arange(max_num_leaves), (self.n_kv_heads, 1)), dtype=np.int32)
                 dci_db.address_update(indices=page_indices, new_address=new_address,
                                                num_pages=dci_db.num_leaves, offset=self.n_kv_heads*self.page_size*self.head_dim)
+                if self.retrieval_backend == "pag_mips":
+                    try:
+                        from .pag_retrieval import PagPageSelector
+                        mapping = np.asarray(dci_db.token2node[0], dtype=np.int32).reshape(self.n_kv_heads, -1)[:, :dci_len].copy()
+                        self.pag_selectors[cur_id] = PagPageSelector(
+                            cur_id, key_states.float().numpy(), mapping,
+                            *self.pag_config, executor=self._ensure_pag_pool())
+                    except Exception as exc:
+                        self.pag_disabled.add(cur_id)
+                        print(f"PAG build failed on layer {cur_id}; using DCI: {exc}")
             else:
                 old_index, old_offset = self.dci_db[reuse_id].token2node
                 layer_offset = _base - self.cpu_kv_caches[reuse_id][b, 0].data_ptr()
@@ -658,6 +884,9 @@ class InferState:
 
     def _DCI_add(self, b, cur_id, key_states, value_states):
         if self.use_dci:
+            if self.retrieval_backend == "page_scan":
+                self._page_scan_add(b, cur_id, key_states, value_states)
+                return
 
             dci_len = key_states.shape[1]
 
@@ -785,6 +1014,13 @@ class InferState:
             if self.check_reuse(cur_id) == 0:
                 dci_db.address_update(indices=new_indices, new_address=new_address,
                                                num_pages=new_num_leaves, offset=self.n_kv_heads*self.page_size*self.head_dim)
+                if self.pag_selectors[cur_id] is not None and cur_id not in self.pag_disabled:
+                    try:
+                        mapping = np.asarray(dci_db.token2node[0], dtype=np.int32).reshape(self.n_kv_heads, -1)[:, :self.pag_selectors[cur_id].count + dci_len].copy()
+                        self.pag_selectors[cur_id].insert(key_states.float().numpy(), mapping)
+                    except Exception as exc:
+                        self.pag_disabled.add(cur_id)
+                        print(f"PAG insert failed on layer {cur_id}; using DCI: {exc}")
             else:
                 old_index, old_offset = self.prev_index, self.prev_offset
                 new_index, new_offset = dci_db.token2node
@@ -797,6 +1033,28 @@ class InferState:
             bsz = 1
 
             num_neighbours = self.n_dci_pages - self.layer2topk[cur_id]
+
+            if self.retrieval_backend == "page_scan":
+                # num_neighbours is per-layer, exactly as DCI computes it: the
+                # shape assert in _apply_selected_pages uses this same
+                # expression (spec section 6b, C3). No DCI state is touched.
+                query_start = perf_counter()
+                # Pass the tensor through: PageScan's device scan copies it to
+                # the GPU itself, so a numpy() conversion here would be a no-op
+                # view on an already-CPU tensor -- it buys nothing and is not
+                # what the scan's cost consists of. The real transfers are the
+                # host->device copy of `q` and the device->host copy of the
+                # result, and the latter synchronises the stream, so
+                # query_seconds["page_scan"] includes whatever was already
+                # queued. (An earlier comment here cited "1.91 vs 0.61 ms" for
+                # this conversion; that measurement is not reproducible from
+                # this call path, because `query_states` arrives here already
+                # on the CPU -- see the `.cpu()` at the _DCI_query call site.)
+                _query = query_states.reshape(-1, self.head_dim).float()
+                page_ids = self.page_scans[cur_id].query(_query, num_neighbours)
+                self.query_seconds["page_scan"].append(perf_counter() - query_start)
+                return self._apply_selected_pages(b, cur_id, page_ids)
+
             query_field_of_view = max(
                 int((self.seq_len) * self.search_ratio), 30)
             query_prop_to_retrieve = 0.8
@@ -814,6 +1072,26 @@ class InferState:
             kvc = self.kv_caches[cur_id]
 
             assert (_query.flags['C_CONTIGUOUS'])
+            query_start = perf_counter()
+
+            # Gate the PAG path on n_prefetch_layers <= 1: with deeper layer
+            # prefetching this query runs on the asyncio worker thread for a
+            # different layer ahead of time, so keep PAG on the simple
+            # synchronous path only.
+            if (self.retrieval_backend == "pag_mips" and self.n_prefetch_layers <= 1
+                    and cur_id not in self.pag_disabled and self.pag_selectors[cur_id] is not None):
+                try:
+                    page_ids = self.pag_selectors[cur_id].select(
+                        _query, num_neighbours, self.page_size)
+                except InsufficientPagesError:
+                    self.pag_fallback_count += 1
+                except Exception as exc:
+                    self.pag_disabled.add(cur_id)
+                    self.pag_fallback_count += 1
+                    print(f"PAG query failed on layer {cur_id}; using DCI: {exc}")
+                else:
+                    self.query_seconds["pag_mips"].append(perf_counter() - query_start)
+                    return self._apply_selected_pages(b, cur_id, page_ids)
 
             nn_idx, _ = self.dci_db[cur_id].query(_query,
                                                 padding_mask,
@@ -845,27 +1123,76 @@ class InferState:
             nn_idx_0 = np.ascontiguousarray(nn_idx_0)
             nn_idx_1 = np.ascontiguousarray(nn_idx_1)
 
-            padded_arrays = torch.tensor(nn_idx_0, **self._ci32)
-            head_ids = torch.arange(
-                self.n_kv_heads, device=padded_arrays.device).unsqueeze(1)
+            self.query_seconds["dci"].append(perf_counter() - query_start)
+            return self._apply_selected_pages(b, cur_id, nn_idx_0)
 
-            if self.selected_page_idx[cur_id] is None:
-                # evicted_idx, recall_idx, evict_num
-                ns = kvc.n_sink_pages
-                self.selected_page_idx[cur_id] = nn_idx_0
-                recall_idx = torch.tensor(nn_idx_0, **self._i32)
-                evicted_idx = kvc.c2p[b, torch.arange(ns, num_neighbours + ns, **self._i32)].unsqueeze(0).expand(self.n_kv_heads, -1)
-                kvc.cc2gp[b, head_ids, padded_arrays] = evicted_idx.cpu()
-            else:
-                recall_idx, evicted_idx, out_idx = DCI.diff_pages_by_head(nn_idx_0, self.selected_page_idx[cur_id], kvc.ccc[b, head_ids, padded_arrays].numpy(), kvc.cc2gp[b].numpy())
-                self.selected_page_idx[cur_id] = out_idx
-                recall_idx = torch.tensor(recall_idx, **self._i32)
-                evicted_idx = torch.tensor(evicted_idx, **self._i32)
-            
-            evict_num = (recall_idx >= 0).sum(1)
-            kvc.ccc[b, head_ids, padded_arrays] = 0
+    def _apply_selected_pages(self, b, cur_id, nn_idx_0):
+        kvc = self.kv_caches[cur_id]
+        num_neighbours = self.n_dci_pages - self.layer2topk[cur_id]
+        if nn_idx_0.shape != (self.n_kv_heads, num_neighbours):
+            raise ValueError('Page selector returned the wrong shape')
+        padded_arrays = torch.tensor(nn_idx_0, **self._ci32)
+        head_ids = torch.arange(
+            self.n_kv_heads, device=padded_arrays.device).unsqueeze(1)
 
-            return evicted_idx.contiguous(), recall_idx.contiguous(), evict_num
+        if self.selected_page_idx[cur_id] is None:
+            # evicted_idx, recall_idx, evict_num
+            ns = kvc.n_sink_pages
+            self.selected_page_idx[cur_id] = nn_idx_0
+            recall_idx = torch.tensor(nn_idx_0, **self._i32)
+            evicted_idx = kvc.c2p[b, torch.arange(ns, num_neighbours + ns, **self._i32)].unsqueeze(0).expand(self.n_kv_heads, -1)
+            kvc.cc2gp[b, head_ids, padded_arrays] = evicted_idx.cpu()
+        else:
+            recall_idx, evicted_idx, out_idx = DCI.diff_pages_by_head(nn_idx_0, self.selected_page_idx[cur_id], kvc.ccc[b, head_ids, padded_arrays].numpy(), kvc.cc2gp[b].numpy())
+            self.selected_page_idx[cur_id] = out_idx
+            recall_idx = torch.tensor(recall_idx, **self._i32)
+            evicted_idx = torch.tensor(evicted_idx, **self._i32)
+
+        evict_num = (recall_idx >= 0).sum(1)
+        kvc.ccc[b, head_ids, padded_arrays] = 0
+
+        return evicted_idx.contiguous(), recall_idx.contiguous(), evict_num
+
+    def retrieval_stats(self):
+        def latency(values):
+            if not values:
+                return {"count": 0}
+            ms = np.asarray(values, dtype=np.float64) * 1000
+            return {"count": len(values), "p50_ms": float(np.percentile(ms, 50)),
+                    "p95_ms": float(np.percentile(ms, 95)),
+                    "p99_ms": float(np.percentile(ms, 99))}
+
+        selectors = {}
+        for layer, selector in enumerate(self.pag_selectors):
+            if selector is not None:
+                selectors[layer] = {
+                    "build_ms": selector.build_seconds * 1000,
+                    "queries": selector.query_count,
+                    "retries": selector.retry_count,
+                    "shortfalls": selector.shortfall_count,
+                    "inserted_tokens": selector.insert_count,
+                    "search": latency(selector.search_seconds),
+                    "aggregate": latency(selector.aggregate_seconds),
+                    "insert": latency(selector.insert_seconds),
+                }
+        scans = {}
+        for layer, scan in enumerate(self.page_scans):
+            if scan is not None:
+                scans[layer] = {
+                    "build_ms": scan.build_seconds * 1000,
+                    "n_built": [int(n) for n in scan.n_built],
+                    "n_pages_reserved": int(scan.n_pages),
+                    "queries": len(scan.query_seconds),
+                    "inserts": len(scan.insert_seconds),
+                    "query": latency(scan.query_seconds),
+                    "insert": latency(scan.insert_seconds),
+                }
+        return {"configured_backend": self.retrieval_backend,
+                "disabled_layers": sorted(self.pag_disabled),
+                "fallback_queries": self.pag_fallback_count,
+                "query": {name: latency(values) for name, values in self.query_seconds.items()},
+                "pag_layers": selectors,
+                "page_scan_layers": scans}
 
     def append_paged_kv_cache(self, layer_idx: int, keys: Tensor, vals: Tensor):
         kvc = self.kv_caches[layer_idx]
@@ -961,7 +1288,12 @@ class InferState:
 
                     self.recall(layer_idx, i, rids, nr)
 
-                    if self.check_reuse(layer_idx) == 0:
+                    if self.retrieval_backend == "page_scan":
+                        # True per-(page, head) occupancy, never -1 (spec 6b, C2/C5).
+                        source = layer_idx if self.check_reuse(layer_idx) == 0 else reuse_id
+                        self.page_valid_entries[layer_idx][ns: ns + self.n_dci_pages - self.layer2topk[layer_idx]] = torch.tensor(
+                            self.page_scans[source].get_valid_entries(self.selected_page_idx[source]), **self._i32).T
+                    elif self.check_reuse(layer_idx) == 0:
                         self.page_valid_entries[layer_idx][ns: ns + self.n_dci_pages - self.layer2topk[layer_idx]] = torch.tensor(
                             self.dci_db[layer_idx].get_valid_entries(self.selected_page_idx[layer_idx]), **self._i32).T
                     else:
