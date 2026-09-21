@@ -120,6 +120,78 @@ class PageScanError(RuntimeError):
     """Invalid configuration, or the pre-reserved page space was exhausted."""
 
 
+def greedy_packed_pages(k, page_size, use_sim=True):
+    """Greedy-pack ``k`` into pages of ``page_size`` (spec section 2).
+
+    ``k`` is ``[M, N, D]`` float32. Returns ``packed`` ``[M, N]`` int32 holding
+    ``page * page_size + slot`` per token, ``-1`` for a token never assigned.
+
+    The greedy is one seed per page plus ``page_size - 1`` expansions:
+
+    * seed -- highest ``||k||`` still unassigned (equals the next entry of the
+      descending-norm seed order);
+    * expansion -- argmax inner product against the *seed*, over the whole
+      unassigned set. The seed's score row is fixed for the page and the masked
+      entry set only shrinks, so the sequential "argmax, mask, argmax, ..."
+      picks exactly the descending order of one ``topk`` over that row (spec
+      section 6b, C6). Exact, not approximate.
+
+    Every operation is row-independent, so packing ``M`` heads together --
+    including heads belonging to *different layers* -- gives bit-identical
+    per-head results to packing them one at a time. Measured on two real
+    prefill layers (M=16, N=11770): 0/188320 differing entries.
+
+    ``use_sim`` materialises the exact ``[M, N, N]`` similarity once and gathers
+    each seed row out of it. That is the fastest route for a single layer (8
+    heads -> 8.27 GB) but impossible for a cross-layer batch (96 heads -> 99 GB),
+    so a batched caller sets ``use_sim=False`` and recomputes just the one row it
+    needs per iteration as an ``[M, 1, D] @ [M, D, N]`` bmm. That trades away
+    holding ``N**2`` floats per head for ~4x more memory traffic (~790 GB at
+    M=96, so bandwidth-bound at ~1.4 TB/s) -- and still beats ``M`` separate
+    builds 4.27x, because every other op in the loop is launch-latency-bound and
+    costs the same at M=8 as at M=96 (316 ms/layer -> 66 ms/layer).
+    """
+    M, N, _ = k.shape
+    n_built = -(-N // page_size)
+    heads = torch.arange(M, device=k.device)
+    norms = (k * k).sum(-1)                                   # [M, N]
+    packed = torch.full((M, N), -1, dtype=torch.int32, device=k.device)
+    assigned = torch.zeros((M, N), dtype=torch.bool, device=k.device)
+    neg = float("-inf")
+    # The similarity is what allows the gather; without it every iteration pays
+    # a full [M, D, N] pass over the keys (see the docstring).
+    sim = torch.bmm(k, k.transpose(1, 2)) if use_sim else None
+    kT = None if use_sim else k.transpose(1, 2)
+
+    # Only the pages that exist are built. Iterating the reserved count would run
+    # argmax on an all-assigned row and silently re-assign tokens (6b, C5).
+    for page in range(n_built):
+        n_members = min(page_size, N - page * page_size)
+        n_expand = n_members - 1                              # slots 1..n_members-1
+        seed = torch.argmax(norms.masked_fill(assigned, neg), dim=1)
+        assigned[heads, seed] = True
+        packed[heads, seed] = page * page_size
+        if n_expand <= 0:
+            continue
+        if use_sim:
+            row = sim[heads, seed]
+        else:
+            row = torch.bmm(k[heads, seed].unsqueeze(1), kT).squeeze(1)
+        # Masked with `assigned`, so every candidate is still unassigned --
+        # `N - page * page_size - 1 >= n_expand` unassigned tokens always remain
+        # and the topk is full.
+        row = row.masked_fill(assigned, neg)
+        _, cand = torch.topk(row, n_expand, dim=1)
+        slots = torch.arange(1, n_members, dtype=torch.int32,
+                             device=k.device).expand_as(cand)
+        packed.scatter_(1, cand, page * page_size + slots)
+        assigned.scatter_(1, cand, True)
+
+    if not bool(assigned.all()):
+        raise PageScanError("greedy packing left tokens unassigned")
+    return packed
+
+
 class PageScan:
     """Capacity-constrained greedy pages plus an exact scan over their means.
 
@@ -219,77 +291,85 @@ class PageScan:
 
         start = perf_counter()
         with torch.no_grad():
-            # Exact pairwise similarity: the whole build cost. Every expansion
-            # below reads a row out of it, so the keys are never re-read.
-            sim = torch.bmm(k, k.transpose(1, 2))
-            heads = torch.arange(H, device=self.device)
-            norms = (k * k).sum(-1)                                # [H, N]
-            packed = torch.full((H, N), -1, dtype=torch.int32, device=self.device)
-            assigned = torch.zeros((H, N), dtype=torch.bool, device=self.device)
-            neg = float("-inf")
+            packed = greedy_packed_pages(k, P, use_sim=True)
+            self._adopt_partition(packed, k, n_reserved)
+        self.build_seconds = perf_counter() - start
+        return self
 
-            # Only the pages that exist are built. Iterating the reserved count
-            # would run argmax on an all-assigned row and silently re-assign
-            # tokens (spec section 6b, C5).
-            for page in range(n_built):
-                n_members = min(P, N - page * P)
-                n_expand = n_members - 1                    # slots 1..n_members-1
-                # Seed: highest ||k|| still unassigned == next in seed order.
-                seed = torch.argmax(norms.masked_fill(assigned, neg), dim=1)
-                assigned[heads, seed] = True
-                packed[heads, seed] = page * P
-                if n_expand <= 0:
-                    continue
-                # Expansion: argmax inner product against the SEED (not against
-                # the last added member), over the whole unassigned set. The
-                # seed's score row is fixed for the whole page and the masked
-                # entry set only shrinks, so the sequential
-                # "argmax, mask, argmax, ..." picks exactly the descending order
-                # of one topk over that row (spec section 6b, C6). The row is
-                # masked with `assigned`, so every candidate it returns is still
-                # unassigned -- `N - page * P - 1 >= n_expand` unassigned tokens
-                # always remain, so the topk is full. Exact, not approximate:
-                # `page_scan.py --self-test` compares it to the literal greedy.
-                row = sim[heads, seed].masked_fill(assigned, neg)   # [H, N]
-                _, cand = torch.topk(row, n_expand, dim=1)
-                slots = torch.arange(1, n_members, dtype=torch.int32,
-                                     device=self.device).expand_as(cand)
-                packed.scatter_(1, cand, page * P + slots)
-                assigned.scatter_(1, cand, True)
+    def build_from_packed(self, packed, keys, n_reserved=None):
+        """``build`` with the partition handed in, for a cross-layer batch.
 
-            if not bool(assigned.all()):
-                raise PageScanError("greedy packing left tokens unassigned")
-            del sim
+        ``packed`` is this layer's ``[H, N]`` slice of
+        :func:`greedy_packed_pages` run once over several layers' keys; ``keys``
+        is the same ``[H, N, D]`` this layer would have passed to ``build``.
+        The greedy is bit-identical to building this layer alone, so this exists
+        only to avoid paying the greedy 12 times over.
+        """
+        k = torch.as_tensor(keys, dtype=torch.float32, device=self.device)
+        if k.ndim != 3 or k.shape[0] != self.n_kv_heads or k.shape[2] != self.head_dim:
+            raise PageScanError(
+                f"keys must be [{self.n_kv_heads}, N, {self.head_dim}], got {tuple(k.shape)}")
+        packed = torch.as_tensor(packed, dtype=torch.int32, device=self.device)
+        H, N, D = k.shape
+        if packed.shape != (H, N):
+            raise PageScanError(
+                f"packed must be [{H}, {N}] for these keys, got {tuple(packed.shape)}")
+        if N == 0:
+            raise PageScanError("build requires at least one token")
+        n_built = -(-N // self.page_size)
+        if n_reserved is None:
+            n_reserved = n_built + self.reserve_pages
+        if n_reserved < n_built:
+            raise PageScanError(
+                f"n_reserved={n_reserved} cannot hold the {n_built} built pages")
+        start = perf_counter()
+        with torch.no_grad():
+            self._adopt_partition(packed, k, n_reserved)
+        self.build_seconds = perf_counter() - start
+        return self
 
-            page_of = torch.where(packed >= 0, packed // P, packed)
-            slot_of = torch.where(packed >= 0, packed % P, packed)
-            if not bool((page_of[:, :].amax(dim=1) < n_built).all()):
-                raise PageScanError("greedy packing assigned a token out of range")
+    def _adopt_partition(self, packed, k, n_reserved):
+        """Validate a greedy partition and make it this scan's state.
 
-            # Representatives: mean of the members (spec section 2 -- the mean,
-            # not the medoid, measured to be the better ranker).
-            reps = torch.zeros((H, n_reserved, D), dtype=torch.float32, device=self.device)
-            sizes = torch.zeros((H, n_reserved), dtype=torch.int32, device=self.device)
-            ones = torch.ones((N,), dtype=torch.int32, device=self.device)
-            for h in range(H):
-                reps[h].index_add_(0, page_of[h], k[h])
-                sizes[h].index_add_(0, page_of[h], ones)
-            reps /= sizes.clamp(min=1).unsqueeze(-1).float()
+        Shared by ``build`` and ``build_from_packed``: those differ only in where
+        ``packed`` came from, and everything downstream -- ``token2page``,
+        ``offset_in_page``, ``page_sizes``, ``reps``, the device mirror and the
+        unbuilt-page bias -- must be derived identically, or a batched layer
+        would silently disagree with a singly-built one.
+        """
+        H, N, D = k.shape
+        P = self.page_size
+        n_built = -(-N // P)
+        page_of = torch.where(packed >= 0, packed // P, packed)
+        slot_of = torch.where(packed >= 0, packed % P, packed)
+        if not bool((packed >= 0).all()):
+            raise PageScanError("greedy packing left tokens unassigned")
+        if not bool((page_of[:, :].amax(dim=1) < n_built).all()):
+            raise PageScanError("greedy packing assigned a token out of range")
 
-            self.token2page = page_of.cpu().numpy().astype(np.int32)
-            self.offset_in_page = slot_of.cpu().numpy().astype(np.int32)
-            self.page_sizes = sizes.cpu().numpy().astype(np.int32)
-            self.reps = reps.cpu().numpy()
-            if self.device.type != "cpu":
-                self._reps_t = reps
-                # Unbuilt pages have an all-zero representative (index_add_ over
-                # an empty set, then divide by clamp(min=1)), and 0 is not a low
-                # score. query() adds this bias so they can never win a slot
-                # (spec section 6b, C1). Entries are cleared as pages are
-                # emitted by insert().
-                self._bias_t = torch.full((H, n_reserved), float("-inf"),
-                                          dtype=torch.float32, device=self.device)
-                self._bias_t[:, :n_built] = 0.0
+        # Representatives: mean of the members (spec section 2 -- the mean, not
+        # the medoid, measured to be the better ranker).
+        reps = torch.zeros((H, n_reserved, D), dtype=torch.float32, device=self.device)
+        sizes = torch.zeros((H, n_reserved), dtype=torch.int32, device=self.device)
+        ones = torch.ones((N,), dtype=torch.int32, device=self.device)
+        for h in range(H):
+            reps[h].index_add_(0, page_of[h], k[h])
+            sizes[h].index_add_(0, page_of[h], ones)
+        reps /= sizes.clamp(min=1).unsqueeze(-1).float()
+
+        self.token2page = page_of.cpu().numpy().astype(np.int32)
+        self.offset_in_page = slot_of.cpu().numpy().astype(np.int32)
+        self.page_sizes = sizes.cpu().numpy().astype(np.int32)
+        self.reps = reps.cpu().numpy()
+        if self.device.type != "cpu":
+            self._reps_t = reps
+            # Unbuilt pages have an all-zero representative (index_add_ over an
+            # empty set, then divide by clamp(min=1)), and 0 is not a low score.
+            # query() masks this in so they can never win a slot (spec section
+            # 6b, C1). Entries are cleared as pages are emitted by insert().
+            self._bias_t = torch.full((H, n_reserved), float("-inf"),
+                                      dtype=torch.float32, device=self.device)
+            self._bias_t[:, :n_built] = 0.0
 
         self.count = N
         self.n_pages = n_reserved
@@ -297,8 +377,6 @@ class PageScan:
         self._free = (self.page_sizes < P) & (
             np.arange(self.n_pages, dtype=np.int32)[None, :] < self._n_built[:, None])
         self.last_insert = None
-        self.build_seconds = perf_counter() - start
-        return self
 
     # ------------------------------------------------------------------ query
 
