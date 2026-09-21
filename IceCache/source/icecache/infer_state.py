@@ -773,11 +773,18 @@ class InferState:
 
         This is the whole TTFT fix. The greedy's per-page ops (``argmax``,
         ``masked_fill``, ``topk``, both scatters) are launch-latency-bound, not
-        throughput-bound: taking the head count from 8 to 96 costs 1.04x in
-        total, i.e. 0.09x per head. So packing all 12 builder layers' 96 heads in
-        a single call costs about what packing one layer costs, and the build
-        goes from 3408 ms to 798 ms on a 16k prompt -- essentially the entire
-        TTFT gap against DCI (3.0 s).
+        throughput-bound, so they cost about the same at M=8 as at M=96. The row
+        bmm is not in that class -- it is bandwidth-bound and does scale with M
+        -- so the loop as a whole is not head-independent. Measured on synthetic
+        keys at the real shape (M=96, N=16072, page_size 16, use_sim=False,
+        median of 3): 96 heads cost 796.5 ms against 291.8 ms for one 8-head
+        layer, i.e. 2.73x in total and 0.227x per head. An earlier version of
+        this comment read "1.04x in total, 0.09x per head", which generalised
+        the latency-bound ops to the whole loop and conflated 12x heads with
+        12x layers; it was wrong and is not worth inheriting. The build still
+        goes from 3408 ms to 798 ms on a 16k prompt -- 12 x 291.8 = 3502 ms
+        unbatched, a 4.4x win -- which is essentially the entire TTFT gap
+        against DCI (3.0 s).
 
         Batching is bit-exact against per-layer builds: every op in the loop is
         row-independent, and measured on real keys packing 16 heads at once vs
