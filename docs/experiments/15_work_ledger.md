@@ -274,6 +274,26 @@ page_scan 端到端要追回 **0.544 s**（报告 `16_` §2.1），而这个尾�
 而是「两条轴都赢，而且端到端更快」。这比再挤 TPOT 有价值得多：
 TPOT 已经领先 1.23x，而 `total_s` 现在还是负的。
 
+### 尾巴的现状（2026-09-23 复核，报告 `17_`）
+
+**先纠正一个曾把这条线判死的前提：尾巴没有衰减。** 此前认为「尾巴上省的毫秒只有约 35%
+能到达 TTFT」（依据是一个探针 −478 ms 尾巴对 −152 ms live TTFT）。恒等式
+`ΔTTFT = Δworker_end + Δtail + Δafter_tail` 实测**残差 0.0 ms（6/6 行）**，
+`tail_start − worker_end` 在 24 组测量上是 **0.06–0.12 ms**——尾巴完全串行，
+没有任何东西藏在 prefill worker 后面。那个缺口是行选择 + 估计量造成的，
+用抗争用估计量重分析给出 **−217 ms**。**尾巴里省的每一毫秒就是一毫秒 TTFT。**
+
+**row 12，改动 `d86be89` 之后尾巴 ≈ 1169 ms 的构成：**
+
+| 项 | 量级 | 状态 |
+|---|---|---|
+| greedy | **~638 ms** | 最大项，**进行中**：算法角度——循环是 ~1005 步严格串行的，但 `row = s · k_j` 不依赖分配状态，只有 mask 依赖；种子按范数降序产生，所以种子集合被限制在范数排序的前缀内 |
+| **CPU 页写 scatter** | **~296 ms** | **进行中**：另一个 agent 在做（`_page_scan_write`） |
+| H2D | ~171 ms | pinned 变体已实测否决（见 `17_` §2） |
+
+**已完成的 `d86be89`（stash 复用 + H2D 直推）：TTFT −200…−390 ms、160/160 逐字段相同，
+代价是常驻内存 +4.15 GiB（峰值反而 −500 MB）。合并前必须声明这项内存代价。**
+
 ---
 
 ## 附 · 报告与数据索引
@@ -284,6 +304,7 @@ TPOT 已经领先 1.23x，而 `total_s` 现在还是负的。
 | 分支 D | `docs/experiments/11_exact_greedy_fast.md` |
 | 第 4 轮 staging / decode / prefill | `docs/experiments/12_` `13_` `14_*.md` |
 | **★ §12.2 正面对决：page_scan vs DCI 直接测** | **`docs/experiments/16_merged_head_to_head.md`** |
+| **page_scan 的 TTFT 尾巴：stash 复用 + H2D 直推** | **`docs/experiments/17_page_scan_tail.md`**（改动 `d86be89`，**待合并**） |
 | 早期报告 01–10 | 仅本机 `experiment/`，未入库 |
 | 第 1 轮三条否决分支 | tag `archive/explore-{batch-knn,pag-prefill,logsumexp}` 上的 `REPORT.md`（**不在 `algorithm` 上**） |
 | 分支 A / C 报告 | tag `archive/explore-recursive-split`、`archive/explore-adaptive-pages` 上的 `REPORT.md` |
