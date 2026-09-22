@@ -138,6 +138,11 @@ class InferState:
         # _page_scan_first_call; the greedy and the CPU page write run as one
         # batch in _page_scan_flush. See that method for why they are deferred.
         self._page_scan_deferred = []
+        # The K/V those entries point into, and the device copy of the builder
+        # slice. Both are allocated once and reused; see _page_scan_stash_put.
+        self._page_scan_stash = None
+        self._page_scan_stash_used = 0
+        self._page_scan_keys_dev = None
         self.query_seconds = {"dci": [], "pag_mips": [], "page_scan": []}
         self._pag_pool = None
         self._ensure_pag_pool()
@@ -391,6 +396,7 @@ class InferState:
         self.selected_page_idx = [None] * self.n_layers
         self.page_scans = [None] * self.n_layers
         self._page_scan_deferred = []
+        self._page_scan_stash_used = 0
         self.kv_caches = [None] * self.n_layers
         self.cpu_kv_caches = [None] * self.n_layers
         self.temp_cpu_kv_caches = [None] * self.n_layers
@@ -542,6 +548,7 @@ class InferState:
             self.pag_fallback_count = 0
             self.page_scans = [None] * self.n_layers
             self._page_scan_deferred = []
+            self._page_scan_stash_used = 0
             self.query_seconds = {"dci": [], "pag_mips": [], "page_scan": []}
             # page_scan builds its own structure in _DCI_first_call; the DCI
             # tree is not allocated at all for that backend.
@@ -777,15 +784,78 @@ class InferState:
                 tmp_addr = self.page_address_buffer[reuse_id][b, i, :scan.n_pages] + layer_offset
                 self.page_address_buffer[cur_id][b, i, :scan.n_pages] = np.array(
                     tmp_addr, dtype=np.uintp)
-        # clone(): the source is a temp_cpu_kv_cache that its caller frees as soon
-        # as this returns (infer_state.py:1434), but the write waits for the flush.
-        self._page_scan_deferred.append((b, cur_id, k.clone(), v.clone(), reuse_id))
+        # Copy, not clone(): the source is a temp_cpu_kv_cache that its caller
+        # frees as soon as this returns (infer_state.py:1434), but the write waits
+        # for the flush. The copy goes into a buffer reused across prompts rather
+        # than a fresh pair per layer -- see _page_scan_stash_put for why.
+        stash_k, stash_v = self._page_scan_stash_put(k, v)
+        self._page_scan_deferred.append((b, cur_id, stash_k, stash_v, reuse_id))
         if not self.page_scan_batch:
             # One layer per flush: the pre-batching behaviour. Kept switchable so
             # the TTFT delta can be measured against it in the same process, and
             # so a batch that ever misbehaved has a way out. Both paths use the
             # same greedy (use_sim=False), which isolates batching itself.
             self._page_scan_flush()
+
+    def _page_scan_stash_put(self, k, v):
+        """Copy one layer's K/V into the reused host stash; return the views.
+
+        This used to be ``k.clone()``/``v.clone()``: a fresh pair of host tensors
+        per layer, 68 tensors and 2.2 GB per 16k prompt. Allocating them is
+        hidden on the worker thread, but *releasing* them is not -- the last
+        reference dies when ``_page_scan_flush`` returns, i.e. on the main thread,
+        inside the TTFT tail. glibc mmaps each 32 MB block, so that release is 68
+        munmaps and it measured **332 ms of a 1591 ms tail** (row 12, hotpotqa,
+        today's HEAD; docs/experiments/17_page_scan_tail.md §2).
+
+        One buffer reused across prompts removes the churn outright: no
+        allocation or release per prompt, and the copy into it stays on the
+        worker thread where the clone always was.
+
+        **Pageable, not pinned -- measured, and the opposite of the obvious
+        guess.** Pinned is 3.5x faster to *DMA from* (12.3 against 4.7 GB/s for
+        the 390 MB builder slice) and that is worth 50 ms, but it is 8x slower to
+        *write into*: a 32.6 MB copy into a pinned slot measured 12 ms against
+        1.5 ms pageable, and in the live process a pinned stash cost 125 ms per
+        layer on the worker thread -- 4.3 s over 34 layers, enough to make the
+        worker the critical path and push row-12 TTFT to 8.3 s. The stores are
+        the wrong side of the trade, so the stash is pageable and the DMA pays
+        the 4.7 GB/s.
+
+        Bit-identity: this is a plain copy of the same bytes into a different
+        address. Nothing downstream reads the address, only the values.
+        """
+        need = k.numel() + v.numel()
+        buf = self._page_scan_stash
+        if buf is None or self._page_scan_stash_used + need > buf.numel():
+            capacity = need * self.n_layers
+            if buf is not None:
+                capacity = max(capacity, 2 * buf.numel())
+            buf = torch.empty(capacity, dtype=k.dtype)
+            self._page_scan_stash = buf
+            self._page_scan_stash_used = 0
+        off = self._page_scan_stash_used
+        self._page_scan_stash_used = off + need
+        k_view = buf[off:off + k.numel()].view(k.shape)
+        v_view = buf[off + k.numel():off + need].view(v.shape)
+        k_view.copy_(k)
+        v_view.copy_(v)
+        return k_view, v_view
+
+    def _page_scan_keys_device(self, n_rows, N, D, dtype):
+        """The device mirror of the builder slice, allocated once and reused.
+
+        Same argument as :meth:`_page_scan_stash_put` on the device side: the
+        flush used to build this with ``torch.cat(...).to(device)`` per prompt
+        (a 390 MB host cat plus an H2D) and free it at the end (56 ms of
+        allocator). Reusing it makes the H2D the only remaining cost, and it is
+        a pinned DMA with no cat in front of it.
+        """
+        buf = self._page_scan_keys_dev
+        if buf is None or buf.shape != (n_rows, N, D) or buf.dtype != dtype:
+            buf = torch.empty((n_rows, N, D), dtype=dtype, device=self.device)
+            self._page_scan_keys_dev = buf
+        return buf
 
     def _page_scan_flush(self):
         """Run every deferred greedy as ONE batch, then write each layer's pages.
@@ -829,7 +899,16 @@ class InferState:
             if len(lengths) != 1:
                 raise RuntimeError(
                     f"page_scan batch needs one token count across layers, got {sorted(lengths)}")
-            keys = torch.cat([pending[i][2] for i in builders], dim=0).to(self.device)
+            # One DMA per builder layer straight out of the stash, into a device
+            # buffer that outlives the flush. The greedy and every
+            # build_from_packed below run on this stream, so the copies are
+            # ordered ahead of their first reader without an explicit sync.
+            sample = pending[builders[0]][2]
+            keys = self._page_scan_keys_device(
+                len(builders) * H, int(sample.shape[1]), int(sample.shape[2]),
+                sample.dtype)
+            for slot, i in enumerate(builders):
+                keys[slot * H:(slot + 1) * H].copy_(pending[i][2], non_blocking=True)
             packed = greedy_packed_pages(keys, self.page_size, use_sim=False)
             for n, i in enumerate(builders):
                 cur_id = pending[i][1]
@@ -839,7 +918,7 @@ class InferState:
                 scan.build_from_packed(
                     packed[n * H:(n + 1) * H], keys[n * H:(n + 1) * H],
                     n_reserved=scan.n_pages)
-            del keys, packed
+            del packed
         # Writes run after every partition exists, so the reuse layers -- which
         # write their own K/V at their source's (page, slot) -- read a partition
         # that is already complete.
@@ -858,6 +937,10 @@ class InferState:
         else:
             for entry in pending:
                 self._page_scan_write_entry(entry)
+        # Every entry has been consumed, so the stash can be handed out again.
+        # The entries above hold views into it, and `pending` is the only thing
+        # that keeps them alive past this point; it dies with the frame.
+        self._page_scan_stash_used = 0
 
     def _page_scan_write_entry(self, entry):
         """Write one stashed layer's K/V into its CPU pages (flush worker body)."""
