@@ -227,6 +227,31 @@ base1 0.8314 → opt 0.7709 → base2 0.8469 ms，168/200，p=9e-24；同代码�
     → **「独立复现」的价值在独立，不在复现数。** 要真独立就串行跑，或者至少把臂的**墙钟**
     和**分块空跑**都记下来；并发只买到 2 倍吞吐，买不到 2 份证据。
 
+13. **子 agent 的 shell cwd 是主检出——相对路径会把改动写进错的那棵树。**
+    后台 agent 的 Bash 从 `/home/yx/IceCache` 起，而且 harness 会在调用之间把它**重置回那里**
+    （transcript 里就是那句 `Shell cwd was reset to /home/yx/IceCache`）。所以一个被要求
+    「在 `.claude/worktrees/X` 里干活」的 agent，只要用**相对路径**编辑，就会写进共享的主检出，
+    而它自己那棵 worktree（建对了、分支也对）**一个字节都没动**。
+    实测：一个新 agent 的 `page_write.cu`/`page_write.h` 和它对 `infer_state.py`/`api.cu`
+    的修改**只存在于主检出**里。后果是（a）worktree 的构建里根本没有这个改动，
+    （b）任何以主检出为基准的测量都看到一个**半应用**的编辑。
+    → **派活时必须给绝对路径，并明确禁止写 `/home/yx/IceCache/IceCache/...`。**
+
+14. **★ 陈旧的 CMake glob 会静默产出一个不含你符号的 `.so`。**
+    `icecache_cpp/CMakeLists.txt` 用 `file(GLOB CPP_SOURCES "src/*.cu")`，**没有
+    `CONFIGURE_DEPENDS`**，文件列表在 **configure 时**就冻结了。在 configure 之后新增 `.cu`，
+    构建会**成功**、import 会**成功**、新符号就是**不存在**——它读起来像「我的 kernel 慢」
+    或「回退路径被触发了」，而不像构建错误。
+    → **新增源文件后必须重跑 cmake。** 配套信号：`infer_state.py` 在
+    `icecache_cpp` 缺少 `scatter_pages_cpu` 时会打印一行回退警告——**把它当作「我的构建是旧的」，
+    不是「预期行为」。**
+
+15. **worktree 里 `git status` 报 "expected submodule path ... not to be a symbolic link" 是良性的。**
+    为了让 `3rdparty/{cutlass,pybind11,raft}` 可用而做的 symlink 会让 git 报这个错。
+    它**只是外观问题**，不要为了「修好它」而退回到主检出里干活（这正是第 13 项那个 agent 掉进去的坑之一）。
+    另注意：symlink `cutlass` **并不能**阻止 raft 的 `get_cutlass.cmake` 再 CPM 拉一份自己的
+    到 `_deps/`——那笔 fetch 是省不掉的，网络是通的，等它跑完即可。
+
 ---
 
 ## 第四部分 · 现在的 §12.2 位置
