@@ -19,8 +19,10 @@ flush, not the offload path.
 
 `adapter/modeling.py:129-148` submits `prefill_evict_extra_pages_wrapper` on
 every prefill layer whose `state.layer2budget[cur_id] is not None`. Nothing in
-that gate, in `prefill_evict_extra_pages` (infer_state.py:1560) or
-`prefill_backup_pages` (:1439) references `retrieval_backend`. Measured: at row
+that gate, in `prefill_evict_extra_pages` (infer_state.py:1623) or
+`prefill_backup_pages` (:1505) references `retrieval_backend` (merged-`algorithm`
+numbering; the reports' other line references to these functions predate the
+merge and are one revision off). Measured: at row
 12, DCI gained −1.865 s and page_scan −1.864 s — same absolute amount to within
 1 ms.
 

@@ -163,7 +163,9 @@ staleness. Two subtleties, both real and both handled:
   False`) before I saw why. The caller re-arms it with `first.fill_(W)` every
   call; caching saves the allocation, not the fill.
 * the mask is derived from `_bias_t`, which `insert()` mutates **in place** at
-  two sites (`:850` rollback, `:863` publish). A mask cached on tensor identity
+  two sites (`:893` rollback, `:910` publish — merged-`algorithm` numbering; the
+  third `_bias_t` write at `:580` follows a rebind, so tensor identity covers
+  it). A mask cached on tensor identity
   alone would go stale and silently stop newly published pages from ever being
   selectable. It is keyed on a `_bias_ver` counter bumped at both sites.
 
