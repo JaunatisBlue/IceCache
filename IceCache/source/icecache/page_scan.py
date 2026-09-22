@@ -150,7 +150,30 @@ def greedy_packed_pages(k, page_size, use_sim=True):
     M=96, so bandwidth-bound at ~1.4 TB/s) -- and still beats ``M`` separate
     builds 4.27x, because every other op in the loop is launch-latency-bound and
     costs the same at M=8 as at M=96 (316 ms/layer -> 66 ms/layer).
+
+    ``use_sim=False`` on CUDA is served by :func:`_greedy_packed_pages_live`,
+    which updates the row scan to read only the tokens that can still be chosen
+    and is required to be output-identical to :func:`_greedy_packed_pages_rescan`
+    (the batched loop as it stood before, kept here as the reference the
+    self-test holds the live path to).
+
+    On CPU the live path is *not* taken. Its bit-identity rests on one property
+    of the row gemv -- that the accumulator for a column does not depend on which
+    other columns are in the operand -- which the production CUDA kernel has (one
+    thread per column, a fixed loop over ``D``) but CPU BLAS does not: blocking
+    is chosen from the operand shape, so a compacted scan rounds differently.
+    Measured on the fuzz case that first exposed it (M=5, N=584, P=9, D=14, the
+    page whose live set has L=403 columns): gathering those exact columns out of
+    the full ``bmm`` row and recomputing them against the compacted operand gives
+    6 of 2015 entries off by one ULP (max relative error 1.0e-07), and 1275 of
+    2015 when the transposed operand is materialised instead of strided -- enough
+    to flip a tied ``topk``. Not a bookkeeping bug: same column set, same order,
+    same seed, gathered from the full row. So CPU keeps the full-width rescan and
+    pays the old cost.
     """
+    if not use_sim:
+        return (_greedy_packed_pages_live(k, page_size) if k.is_cuda
+                else _greedy_packed_pages_rescan(k, page_size))
     M, N, _ = k.shape
     n_built = -(-N // page_size)
     heads = torch.arange(M, device=k.device)
@@ -184,6 +207,177 @@ def greedy_packed_pages(k, page_size, use_sim=True):
         _, cand = torch.topk(row, n_expand, dim=1)
         slots = torch.arange(1, n_members, dtype=torch.int32,
                              device=k.device).expand_as(cand)
+        packed.scatter_(1, cand, page * page_size + slots)
+        assigned.scatter_(1, cand, True)
+
+    if not bool(assigned.all()):
+        raise PageScanError("greedy packing left tokens unassigned")
+    return packed
+
+
+def _greedy_packed_pages_rescan(k, page_size):
+    """The ``use_sim=False`` greedy as it was before live-set compaction.
+
+    Kept for two reasons: it is the reference :func:`_self_test` holds
+    :func:`_greedy_packed_pages_live` to on every shape, including the ones with
+    forced exact ties, and it is the escape hatch if the live path ever has to be
+    turned off. It is byte-for-byte the loop that shipped in ``2ea0cab`` (only
+    the ``use_sim`` conditional, which is constant here, is folded out).
+    """
+    M, N, _ = k.shape
+    n_built = -(-N // page_size)
+    heads = torch.arange(M, device=k.device)
+    norms = (k * k).sum(-1)                                   # [M, N]
+    packed = torch.full((M, N), -1, dtype=torch.int32, device=k.device)
+    assigned = torch.zeros((M, N), dtype=torch.bool, device=k.device)
+    neg = float("-inf")
+    kT = k.transpose(1, 2)
+
+    for page in range(n_built):
+        n_members = min(page_size, N - page * page_size)
+        n_expand = n_members - 1                              # slots 1..n_members-1
+        seed = torch.argmax(norms.masked_fill(assigned, neg), dim=1)
+        assigned[heads, seed] = True
+        packed[heads, seed] = page * page_size
+        if n_expand <= 0:
+            continue
+        row = torch.bmm(k[heads, seed].unsqueeze(1), kT).squeeze(1)
+        row = row.masked_fill(assigned, neg)
+        _, cand = torch.topk(row, n_expand, dim=1)
+        slots = torch.arange(1, n_members, dtype=torch.int32,
+                             device=k.device).expand_as(cand)
+        packed.scatter_(1, cand, page * page_size + slots)
+        assigned.scatter_(1, cand, True)
+
+    if not bool(assigned.all()):
+        raise PageScanError("greedy packing left tokens unassigned")
+    return packed
+
+
+def live_compact_span(n_built, span=None):
+    """Pages between live-set compactions in the batched greedy.
+
+    Sized against the model in :func:`_greedy_packed_pages_live`: a compaction
+    costs two scans of the live set (it reads the live keys and writes them
+    dense) and is amortised over ``span`` pages that then scan the *span-start*
+    live size instead of all ``N``. With ``n = N / page_size`` pages in the
+    build the fraction of the row-scan cost that survives is
+    ``(n + span)(span + 2) / (2 n span)``, minimised at ``span = sqrt(2 n)``
+    (45% saved at n = 1005, and flat within a point or two either side, so the
+    exact constant is not delicate).
+    """
+    if span is not None:
+        return max(1, int(span))
+    return max(1, int((2.0 * n_built) ** 0.5))
+
+
+def _live_token_index(assigned, n_live):
+    """Per row, the ascending indices of the ``False`` (unassigned) entries.
+
+    ``[M, n_live]`` int64. Built by prefix-summing the mask and scattering each
+    token's own index into its rank slot, which is idempotent under any order --
+    unlike ``nonzero``, whose row-major output order is the only thing that makes
+    a reshape safe. Assigned tokens are ranked into one scratch slot past the
+    end of the returned view, so the last writer there does not matter.
+    """
+    M, N = assigned.shape
+    rank = (~assigned).cumsum(1, dtype=torch.int64) - 1
+    rank.masked_fill_(assigned, n_live)
+    tokens = torch.arange(N, device=assigned.device).expand(M, N)
+    buf = torch.empty((M, n_live + 1), dtype=torch.int64, device=assigned.device)
+    buf.scatter_(1, rank, tokens)
+    return buf[:, :n_live]
+
+
+def _greedy_packed_pages_live(k, page_size, span=None):
+    """``use_sim=False`` greedy that rescans only the tokens it can still use.
+
+    Output-identical to the shared loop above -- same seed order, same rows, same
+    ``topk``, same scatters -- and it changes only *how much of ``k`` the
+    per-page row scan reads.
+
+    The scan is the whole cost of the batched build: ``N / page_size`` sequential
+    ``[M, 1, D] @ [M, D, N]`` bmms, each reading all ``M * N * D`` keys, and
+    nothing in the build is reused between pages, so it is DRAM-bound. Measured
+    at M=96, N=16072 (one A100, one build, torch.profiler): 518 ms of the 823 ms
+    total, 793 GB at 1.53 TB/s, which is the card. The only lever left is to read
+    fewer bytes.
+
+    And it reads twice what it can use. ``row`` is masked with ``assigned``
+    before the ``topk``, so at page ``p`` the ``page_size * p`` columns already
+    assigned are read, scored, and thrown away; only the live columns are
+    candidates. Scanning the live keys instead halves the reads, and it is
+    exact: a gemv accumulates ``sum_d A[d, n] * x[d]`` independently per column
+    ``n``, so removing columns cannot move a bit of the columns that stay -- but
+    only for a kernel whose per-column accumulator does not depend on the
+    operand shape. That is true of the CUDA kernel this runs on (measured:
+    ``bmm(s, k_live^T)`` reproduces the full row's columns exactly, 0 of 1542912
+    entries at L from 16072 down to 16) and false of CPU BLAS, which is why the
+    dispatch in `greedy_packed_pages` is CUDA-only.
+
+    Rebuilding the live set is a gather of ``L`` keys (read + write == two
+    scans), so it is amortised over a *span* of pages instead of done per page.
+    Inside a span the live array is a superset of the unassigned set -- tokens
+    assigned during the span are still in it and are masked out of the compact
+    row, which is exactly what the shared loop does to them in the full row.
+    ``span`` defaults to :func:`live_compact_span`.
+
+    The ``topk`` still sees a *full* ``[M, N]`` row: the compact row is scattered
+    back to its tokens' own columns in ``row_buf``, with ``-inf`` everywhere
+    else. That keeps the tensor handed to ``torch.topk`` identical to the shared
+    loop's, so equal-valued candidates break the same way they always did --
+    which a compacted ``topk`` would not guarantee, and which the forced-tie
+    cases in the checks below exist to catch.
+    """
+    M, N, _ = k.shape
+    n_built = -(-N // page_size)
+    heads = torch.arange(M, device=k.device)
+    head_col = heads.unsqueeze(1)                             # [M, 1]
+    norms = (k * k).sum(-1)                                   # [M, N]
+    packed = torch.full((M, N), -1, dtype=torch.int32, device=k.device)
+    assigned = torch.zeros((M, N), dtype=torch.bool, device=k.device)
+    neg = float("-inf")
+    kT = k.transpose(1, 2)
+    row_buf = torch.empty((M, N), dtype=k.dtype, device=k.device)
+    # One arange for the whole build: the shared loop rebuilds it every page.
+    slots_all = torch.arange(1, page_size, dtype=torch.int32, device=k.device)
+    span = live_compact_span(n_built, span)
+    live = span < n_built                                      # else never compact
+    live_idx = None
+    live_k = None
+
+    for page in range(n_built):
+        # The live set at the top of a span is every token no earlier page took,
+        # which is exactly `N - page_size * page` of them. (Recomputed rather
+        # than counted, so a span boundary is not a synchronisation point.)
+        if live and page and page % span == 0:
+            live_idx = _live_token_index(assigned, N - page * page_size)
+            live_k = k[head_col, live_idx]                     # [M, L, D]
+        n_members = min(page_size, N - page * page_size)
+        n_expand = n_members - 1                              # slots 1..n_members-1
+        seed = torch.argmax(norms.masked_fill(assigned, neg), dim=1)
+        assigned[heads, seed] = True
+        packed[heads, seed] = page * page_size
+        if n_expand <= 0:
+            continue
+        s = k[heads, seed].unsqueeze(1)
+        if live_idx is None:
+            row = torch.bmm(s, kT).squeeze(1)
+            row.masked_fill_(assigned, neg)
+        else:
+            # Compact row first, then back into the full [M, N] buffer at the
+            # tokens' own columns. Everything outside `live_idx` was already
+            # assigned when the span opened, and the mask below re-kills those
+            # plus whatever this span has taken since -- so the buffer's stale
+            # values never survive a page and it needs no fill.
+            row_buf.scatter_(1, live_idx,
+                             torch.bmm(s, live_k.transpose(1, 2)).squeeze(1))
+            row_buf.masked_fill_(assigned, neg)
+            row = row_buf
+        _, cand = torch.topk(row, n_expand, dim=1)
+        # slots_all is arange(1, page_size); the page's slots are its first
+        # n_members - 1 entries, which is arange(1, n_members).
+        slots = slots_all[:n_expand].expand_as(cand)
         packed.scatter_(1, cand, page * page_size + slots)
         assigned.scatter_(1, cand, True)
 
@@ -1161,6 +1355,65 @@ def _self_test():
                   f"{dev[0]}")
     else:
         print("SKIP  device-side scan (no CUDA available)")
+
+    # The batched greedy (`use_sim=False`) served by `_greedy_packed_pages_live`
+    # is required to be BIT-identical to `_greedy_packed_pages_rescan`, the loop
+    # it replaces: the partition is what the accuracy of the whole design rides
+    # on, and no recall metric on this box can price a partition change (round 2
+    # measured a -0.0158 accuracy move from a change `pq` scored at -0.003). So
+    # the contract is `torch.equal`, not a score.
+    #
+    # Every case runs at several spans, including span=1 (a compaction boundary
+    # at every page) and spans that do not divide the page count. The tie cases
+    # are the point of the exercise: duplicated keys give a row with exactly
+    # equal scores, and duplicated tokens give exactly equal norms, so the seed
+    # argmax and the topk both have to break a tie. (No page count is large
+    # enough here for the default span to engage, which is why the span is
+    # forced rather than left to `live_compact_span`.)
+    def _greedy_cases(device):
+        for (M, N, P) in ((1, 16, 16), (2, 5, 16), (4, 32, 1), (4, 33, 8),
+                          (3, 97, 7), (2, 200, 16), (5, 512, 16)):
+            k = torch.as_tensor(rng.standard_normal((M, N, 8)) * 2.0,
+                                dtype=torch.float32, device=device)
+            yield f"M={M} N={N} P={P}", k, P
+        # exact norm ties AND exact score ties: whole tokens duplicated, so the
+        # seed's norms collide and its row has repeated values at repeated keys
+        M, N, P = 3, 128, 16
+        k = torch.as_tensor(rng.standard_normal((M, N, 8)) * 2.0,
+                            dtype=torch.float32, device=device)
+        k[:, 40] = k[:, 3]
+        k[:, 41] = k[:, 3]
+        k[:, 90] = k[:, 90]                       # untouched
+        k[:, 100] = 0.0
+        k[:, 101] = 0.0                           # equal zero norms, equal rows
+        yield f"M={M} N={N} P={P} duplicate tokens", k, P
+        # every key identical within a head: every unassigned score is a tie
+        k = torch.ones((2, 64, 8), dtype=torch.float32, device=device)
+        yield "M=2 N=64 P=8 all keys equal", k, 8
+
+    # On CPU the live path is not the one that runs (see `greedy_packed_pages`:
+    # CPU BLAS does not keep a column's accumulator independent of the operand
+    # shape), so what is checked here is the public entry point -- which must
+    # still hand back the shipped loop's bytes.
+    for label, k, P in _greedy_cases("cpu"):
+        want = _greedy_packed_pages_rescan(k, P)
+        got = greedy_packed_pages(k, P, use_sim=False)
+        check(f"batched greedy bit-identical (cpu), {label}",
+              torch.equal(got, want),
+              f"{int((got != want).sum())}/{got.numel()} entries differ")
+    # On CUDA the live path is the one that runs, so it is held to the reference
+    # directly, at several spans, on the tie cases above.
+    if torch.cuda.is_available():
+        for label, k, P in _greedy_cases("cuda:0"):
+            want = _greedy_packed_pages_rescan(k, P)
+            for span in (1, 3):
+                got = _greedy_packed_pages_live(k, P, span=span)
+                check(f"batched greedy bit-identical (cuda), {label}, span={span}",
+                      torch.equal(got, want),
+                      f"{int((got != want).sum())}/{got.numel()} entries differ")
+            check(f"batched greedy bit-identical (cuda dispatch), {label}",
+                  torch.equal(greedy_packed_pages(k, P, use_sim=False), want),
+                  "dispatch did not reach the live path")
 
     print(f"\n{'ALL PASS' if not failures else 'FAILURES: ' + ', '.join(failures)}")
     return 1 if failures else 0
