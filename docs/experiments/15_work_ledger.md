@@ -245,9 +245,10 @@ end-to-end 指标约 90% 是精确并列，哪几行翻转不是任何检索指�
 
 | 内容 | 位置 |
 |---|---|
-| Design A 规格 | `experiment/design_a_spec.md`、`design_a_review.md` |
-| 分支 D | `experiment/11_exact_greedy_fast.md` |
-| 第 4 轮 staging / decode / prefill | `experiment/12_` `13_` `14_*.md` |
+| Design A 规格 | `experiment/design_a_spec.md`、`design_a_review.md`（**仅本机，未入库**；代码注释 `infer_state.py`、`page_scan.py` 指向这里，新克隆上会悬空） |
+| 分支 D | `docs/experiments/11_exact_greedy_fast.md` |
+| 第 4 轮 staging / decode / prefill | `docs/experiments/12_` `13_` `14_*.md` |
+| 早期报告 01–10 | 仅本机 `experiment/`，未入库 |
 | 第 1 轮三条否决分支 | 分支 `explore/{batch-knn,pag-prefill-clustering,logsumexp-retrieval}` 的 `REPORT.md`（**不在 `algorithm` 上**），tag `archive/explore-*` |
 | 分支 A / C 报告 | `explore/recursive-split`、`explore/adaptive-pages` |
 | n=200 决定性准确率 A/B | `explore/accuracy-200`（`7d8ee55`） |

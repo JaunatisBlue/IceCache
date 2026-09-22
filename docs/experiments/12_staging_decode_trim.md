@@ -36,7 +36,7 @@
 > null only proves "A beats B in this window", never "the effect is this large".**
 > The fix is to run the thing under test as its own arm in an interleaved window
 > and across two row blocks — which is how this was caught. See
-> `experiment/15_work_ledger.md` §3 item 11.
+> `docs/experiments/15_work_ledger.md` §3 item 11.
 
 ## TL;DR
 
