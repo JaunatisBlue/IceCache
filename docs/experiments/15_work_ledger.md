@@ -290,21 +290,25 @@ TPOT 已经领先 1.23x，而 `total_s` 现在还是负的。
 | n=200 决定性准确率 A/B | `explore/accuracy-200`（`7d8ee55`） |
 | 原始 jsonl | `/home/yx/.claude/jobs/497cc41a/tmp/`、`/tmp/pagprobe/` |
 
-### 分支清单
+### 分支清单（`explore/*` 已全部删除，历史靠 tag 保留）
 
-以下是全部探索分支的归宿。worktree 目录已在本轮清理，**分支和 commit 一个都没删**，
-仍然可以直接 `git show <sha>` 或 `git checkout <branch>` 取回。
+**2026-09-22：11 条 `explore/*` 分支已按要求删除。删除前先给 4 条「既未合并、也没有 tag」的
+补打了 tag，所以**每一个 commit 都仍然可达**——4 条在 `algorithm` 的历史里，7 条在 tag 上。
+取回方式：`git show <sha>`、`git log archive/explore-<name>`，或 `git checkout <tag>`。
 
-| 分支 | SHA | 已进 `algorithm`？ | 内容 |
+| 原分支 | SHA | 现在靠什么活着 | 内容 |
 |---|---|---|---|
-| `explore/exact-greedy-fast` | `23ee679` | ✅ 已合 | 分支 D — 逐位相同的贪心加速（报告 `11_`） |
-| `explore/staging-fast` | `aed15bb` | ✅ 已合 | 共享 staging 裁剪（报告 `12_`） |
-| `explore/decode-fast` | `840a10a` | ✅ 已合 | page_scan 查询常量提升（报告 `13_`） |
-| `explore/prefill-fast` | `cd74dce` | ✅ 已合 | prefill 卸载拷贝（报告 `14_`） |
-| `explore/recursive-split` | `3923347` | ❌ 未合 | 第 2 轮分支 A，报告在其 `REPORT.md` |
-| `explore/adaptive-pages` | `ec6188f` | ❌ 未合 | 第 2 轮分支 C，报告在其 `REPORT.md` |
-| `explore/page-size-8` | `2abde20` | ❌ 未合 | 分支 E — page_size=8 在 n=200 上是 null |
-| `explore/accuracy-200` | `7d8ee55` | ❌ 未合 | n=200 决定性准确率 A/B，**数据保留，别删** |
-| `explore/batch-knn` | `016746c` | ❌ 未合 | 第 1 轮否决，另打 tag `archive/explore-batch-knn` |
-| `explore/pag-prefill-clustering` | `aba557c` | ❌ 未合 | 第 1 轮否决，另打 tag `archive/explore-pag-prefill` |
-| `explore/logsumexp-retrieval` | `9602df2` | ❌ 未合 | 第 1 轮否决，另打 tag `archive/explore-logsumexp` |
+| `explore/exact-greedy-fast` | `23ee679` | ✅ 在 `algorithm` 里 | 分支 D — 逐位相同的贪心加速（报告 `11_`） |
+| `explore/staging-fast` | `aed15bb` | ✅ 在 `algorithm` 里 | 共享 staging 裁剪（报告 `12_`） |
+| `explore/decode-fast` | `840a10a` | ✅ 在 `algorithm` 里 | page_scan 查询常量提升（报告 `13_`） |
+| `explore/prefill-fast` | `cd74dce` | ✅ 在 `algorithm` 里 | prefill 卸载拷贝（报告 `14_`） |
+| `explore/recursive-split` | `3923347` | tag `archive/explore-recursive-split` | 第 2 轮分支 A，报告在其 `REPORT.md` |
+| `explore/adaptive-pages` | `ec6188f` | tag `archive/explore-adaptive-pages` | 第 2 轮分支 C，报告在其 `REPORT.md` |
+| `explore/page-size-8` | `2abde20` | tag `archive/explore-page-size-8` | 分支 E — page_size=8 在 n=200 上是 null |
+| `explore/accuracy-200` | `7d8ee55` | tag `archive/explore-accuracy-200` | n=200 决定性准确率 A/B |
+| `explore/batch-knn` | `016746c` | tag `archive/explore-batch-knn` | 第 1 轮否决 |
+| `explore/pag-prefill-clustering` | `aba557c` | tag `archive/explore-pag-prefill` | 第 1 轮否决 |
+| `explore/logsumexp-retrieval` | `9602df2` | tag `archive/explore-logsumexp` | 第 1 轮否决 |
+
+**注意：这 7 个 tag 目前只在本地**，`origin` 上一个都没有。要把这份历史推上去，
+需要显式 `git push origin --tags`（用户尚未批准）。
