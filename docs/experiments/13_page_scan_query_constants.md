@@ -1,6 +1,8 @@
 # Branch `explore/decode-fast` — the retrieval-selection step
 
-Worktree `/home/yx/IceCache/.claude/worktrees/decode-fast`, off `algorithm@ef228fa`.
+Branch `explore/decode-fast`, off `algorithm@ef228fa`. (Its worktree directory was
+removed in the 2026-09-22 cleanup; the branch and commits are retained — the old
+path `/home/yx/IceCache/.claude/worktrees/decode-fast` no longer exists.)
 Everything below is my own measurement unless the line says otherwise. Times come
 from `quiet-run.sh`; CPU-sample shares come from a `quiet-run.sh` + `perf record`
 run and are never quoted as times.

@@ -1,6 +1,8 @@
 # `explore/prefill-fast` — the prefill offload copy
 
-Worktree `/home/yx/IceCache/.claude/worktrees/prefill-fast`, off `algorithm@ef228fa`.
+Branch `explore/prefill-fast`, off `algorithm@ef228fa`. (Its worktree directory was
+removed in the 2026-09-22 cleanup; the branch and commits are retained — the old
+path `/home/yx/IceCache/.claude/worktrees/prefill-fast` no longer exists.)
 One commit: **`4b1b939`** — `IceCache/source/icecache/infer_state.py`, +46/−3.
 
 ## 0. Bottom line
