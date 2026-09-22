@@ -800,11 +800,32 @@ class InferState:
     def _page_scan_stash_put(self, k, v):
         """Copy one layer's K/V into the reused host stash; return the views.
 
+        **The stash is fp32, and this docstring used to say otherwise by
+        accident.** Its dtype is not chosen here: it is ``k.dtype`` below, and
+        ``k`` is ``key_states``, which comes from the *CPU* pool
+        (``tmp_cpu_kvc`` -> ``offloaded_pages_cat[0]`` -> ``_page_scan_first_call``)
+        whose ``cpu_dtype`` is ``torch.float32``. The device pool is fp16 and the
+        CPU pool is fp32 -- ``prefill_backup_pages`` says so in as many words
+        ("``dst`` is fp32 host (cpu_dtype) and ``src`` is the fp16 device pool"). Earlier
+        revisions of this docstring quoted the fp16 byte sizes, and three
+        separate readers (two agents and a reviewer) concluded from them that the
+        page-scan greedy is handed half precision. It is not: a one-line print at
+        the flush call site settled it, ``keys.dtype=torch.float32`` at M=96. Do
+        not restate the dtype here without re-measuring it, and do not infer it
+        from the sizes below.
+
+        So every byte figure in this docstring is 4 B/element: a per-layer K (or
+        V) tensor is ``n_kv_heads * N * head_dim * 4`` -- 65.4 MB at N=15968,
+        i.e. 68 tensors and **4.45 GB per 16k prompt**, not 2.2 GB. (The fs
+        block below is correspondingly 65 MB, not 32 MB. A "32 MB block" is what
+        the same tensor weighs at ~8k tokens, which is probably where that
+        number came from.)
+
         This used to be ``k.clone()``/``v.clone()``: a fresh pair of host tensors
-        per layer, 68 tensors and 2.2 GB per 16k prompt. Allocating them is
+        per layer, 68 of them. Allocating them is
         hidden on the worker thread, but *releasing* them is not -- the last
         reference dies when ``_page_scan_flush`` returns, i.e. on the main thread,
-        inside the TTFT tail. glibc mmaps each 32 MB block, so that release is 68
+        inside the TTFT tail. glibc mmaps each 65 MB block, so that release is 68
         munmaps and it measured **332 ms of a 1591 ms tail** (row 12, hotpotqa,
         today's HEAD; docs/experiments/17_page_scan_tail.md §2).
 
@@ -814,13 +835,15 @@ class InferState:
 
         **Pageable, not pinned -- measured, and the opposite of the obvious
         guess.** Pinned is 3.5x faster to *DMA from* (12.3 against 4.7 GB/s for
-        the 390 MB builder slice) and that is worth 50 ms, but it is 8x slower to
+        the ~790 MB builder slice) and that is worth 50 ms, but it is 8x slower to
         *write into*: a 32.6 MB copy into a pinned slot measured 12 ms against
         1.5 ms pageable, and in the live process a pinned stash cost 125 ms per
         layer on the worker thread -- 4.3 s over 34 layers, enough to make the
         worker the critical path and push row-12 TTFT to 8.3 s. The stores are
         the wrong side of the trade, so the stash is pageable and the DMA pays
-        the 4.7 GB/s.
+        the 4.7 GB/s. (The copy sizes in that paragraph are as measured and are
+        prompt-length dependent; at a 16k prompt in fp32 a layer copy is 65.4 MB,
+        so do not read "32.6 MB" as this buffer's size at production length.)
 
         Bit-identity: this is a plain copy of the same bytes into a different
         address. Nothing downstream reads the address, only the values.
@@ -847,7 +870,9 @@ class InferState:
 
         Same argument as :meth:`_page_scan_stash_put` on the device side: the
         flush used to build this with ``torch.cat(...).to(device)`` per prompt
-        (a 390 MB host cat plus an H2D) and free it at the end (56 ms of
+        (a ~790 MB host cat in fp32, not the 390 MB an earlier revision of this
+        docstring quoted -- that was the fp16 size of the same slice, see
+        :meth:`_page_scan_stash_put`; plus an H2D) and free it at the end (56 ms of
         allocator). Reusing it makes the H2D the only remaining cost, and it is
         a pinned DMA with no cat in front of it.
         """
