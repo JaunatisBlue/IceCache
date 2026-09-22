@@ -23,11 +23,11 @@ Two page counts, never conflated (spec section 6b, C1):
 
 The query scan has two implementations that must agree: numpy on the CPU (spec
 section 6b, C7) and, when ``_reps_t`` exists, a device ``bmm``+``topk`` scan.
-The device path is the one the deployed backend uses, and it is NOT free of
-transfers: ``_DCI_query`` receives the query as a CPU tensor (the caller moves
-``query_states`` to the host before dispatch), so every query pays a host->device
-copy of ``q`` plus a device->host copy of the ``[H, budget]`` result. That result
-copy is an implicit stream synchronisation, which means ``query_seconds``
+The device path is the one the deployed backend uses. It is not free of
+transfers, but it is free of the *query* one: ``_DCI_query`` receives the query
+already on the device for this backend (only the DCI path takes it on the host),
+so the only transfer is a device->host copy of the ``[H, budget]`` result. That
+result copy is an implicit stream synchronisation, which means ``query_seconds``
 includes whatever was already queued on the stream and is therefore
 queue-dependent rather than a pure scan latency.
 
@@ -702,10 +702,11 @@ class PageScan:
         ``transpose(0, 2, 1)`` below), then ``first_k_unique``.
 
         All (layer, KV head) structures are the same shape, so the whole layer
-        is one batched ``bmm``. Transfers are the host->device copy of ``q`` (the
-        caller supplies it on the CPU) and the device->host copy of the
-        ``[H, budget]`` result; the latter synchronises the stream. See the module
-        docstring for the tie-breaking caveat against the numpy path.
+        is one batched ``bmm``. The single transfer is the device->host copy of
+        the ``[H, budget]`` result, which synchronises the stream; ``q`` arrives
+        on whichever device it already lives on (the page_scan caller passes it
+        resident, the DCI caller passes numpy). See the module docstring for the
+        tie-breaking caveat against the numpy path.
 
         The op sequence lives in :meth:`_scan_ops`, which is kept free of host
         round trips and of `torch.nonzero` so that it *can* be captured as a
@@ -748,6 +749,15 @@ class PageScan:
         # consulted: `insert` writes `_bias_t` in place, and deriving the mask
         # from it here is both cheaper than a cached copy that has to be
         # invalidated per write and impossible to leave stale.
+        #
+        # Ordered read, unlike the cached mask this replaced: the mask is read
+        # here, *after* the bmm, whereas the cache was populated before it.
+        # `insert` publishes `_reps_t` first and `_bias_t` second, so a reader
+        # interleaved with a publish could pair a fresh bias (0.0, built) with a
+        # still-placeholder zero representative -- a 0.0 score on a page with no
+        # K/V. It is unreachable here: `insert` runs only from `_page_scan_flush`
+        # (prefill) and needs `n_prefetch_layers > 0`, which both entry points
+        # default to 0. Worth revisiting if prefetch is ever enabled.
         scores = scores.masked_fill(self._bias_t.unsqueeze(1) != 0, float("-inf"))
         top = scores.topk(budget, dim=-1).indices               # [H, ratio, budget]
         flat = top.transpose(1, 2).reshape(H, W)                # [H, budget*ratio]
