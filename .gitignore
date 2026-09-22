@@ -1,5 +1,13 @@
 IceCache/source/icecache_cpp.*
-experiment/
+# experiment/ holds both reports and bulk run data. Track the reports (the design
+# spec and the early experiment notes are cited by code comments in page_scan.py and
+# infer_state.py, so a fresh clone needs them); keep the data out.
+# NOTE: this must be `experiment/*` and not `experiment/` -- excluding the
+# directory itself makes every negation below a no-op.
+experiment/*
+!experiment/*.md
+!experiment/*.py
+!experiment/*.sh
 __pycache__/
 IceCache/benchmark/passkey.jsonl
 IceCache/benchmark/pred/
