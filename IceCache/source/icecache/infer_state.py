@@ -187,6 +187,9 @@ class InferState:
         self.n_win_pages = n_win_pages
         assert n_win_pages >= 2
         self.num_offload_pages = None  # number of pages offloaded to CPU
+        # Reused fp32 device staging for the prefill offload copy; see
+        # prefill_backup_pages. Lazily sized, never freed.
+        self._offload_cast_buffer = None
         # number of dci pages in GPU cache (originally, they are all sequential pages)
         self.n_dci_pages = None
         self.use_sparse_attn = use_sparse_attn
@@ -1530,11 +1533,51 @@ class InferState:
             dst = tmp_cpu_kvc.buffer[cpu_start: cpu_start + self.num_offload_pages]
             src = kvc.buffer[gpu_start: gpu_start + self.num_offload_pages]
 
+            # `dst` is fp32 host (cpu_dtype) and `src` is the fp16 device pool, so a
+            # bare `dst.copy_(src)` is a *cross-dtype* device-to-host copy: CUDA
+            # cannot DMA it and falls back to a kernel that stores into host
+            # memory element by element. Measured on this box at the 16k-prompt
+            # shape (998 pages = 65.4 MB fp16 in, 130.8 MB fp32 out, median of 15
+            # with the stream sync inside the timed region):
+            #
+            #   fp16 dev -> fp16 pinned, bare DMA                4.99 ms  26.2 GB/s
+            #   fp32 dev -> fp32 pinned, bare DMA                9.97 ms  13.1 GB/s
+            #   fp16 dev -> fp32 pinned, `dst.copy_(src)`       57.43 ms   2.28 GB/s  <- shipped
+            #   upcast on the device, then fp32 pinned DMA      10.28 ms  12.7 GB/s  <- this
+            #
+            # The bare op was 5.8x off the fp32 pinned-DMA rate it should have
+            # been -- it is not bandwidth, it is the cast-in-the-copy path -- and
+            # 34 layers of it were 2.03 s of the 2.70 s that `prefill_backup_pages`
+            # spent (48.5% of TTFT at 16k). The upcast fp16->fp32 is exact: every
+            # fp16 value is representable in fp32, so this is not a numerics
+            # change, and the destination is `torch.equal` to the bare copy on the
+            # real shape (32.7M elements).
+            #
+            # The cast goes into a reused device buffer rather than into a fresh
+            # `src.to(torch.float32)` per layer: same op, same measured time
+            # (10.28 ms either way), but 34 fewer 131 MB allocations per prompt,
+            # and no allocator traffic on the worker's stream while the main
+            # thread is allocating and freeing activations on another stream.
+            #
+            # `non_blocking=True` is a true async DMA because `dst` is a view of
+            # the pinned CPU pool (`kv_cache.PagePool` pins CPU pools). The stream
+            # sync right after is what makes `dst` readable, and it replaces the
+            # device-wide `torch.cuda.synchronize()` that used to sit here: that
+            # sync waited on the main thread's in-flight kernels rather than on
+            # this copy, and cost 272 ms/row by itself.
             torch.cuda.current_stream().wait_stream(self.default_stream)
-            dst.copy_(src)
-            torch.cuda.synchronize()
-
             current_stream = torch.cuda.current_stream()
+
+            stage = self._offload_cast_buffer
+            if stage is None or stage.shape[0] < self.num_offload_pages:
+                # Grows monotonically over a run (one prompt length at a time).
+                stage = self._offload_cast_buffer = torch.empty(
+                    self.num_offload_pages, *src.shape[1:],
+                    dtype=torch.float32, device=src.device)
+            stage = stage[:self.num_offload_pages]
+
+            stage.copy_(src)
+            dst.copy_(stage, non_blocking=True)
             current_stream.synchronize()
 
     def decode_backup_win_page(self, layer_idx: int):
