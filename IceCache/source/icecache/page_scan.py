@@ -449,7 +449,9 @@ class PageScan:
         self._free = None                         # np.bool_ [H, n_pages]
         self._reps_t = None                       # torch mirror on self.device
         self._bias_t = None                       # [H, n_pages] 0 built / -inf unbuilt
+        self._bias_ver = 0                        # bumped on every in-place _bias_t write
         self._query_scores = None                 # reused [H*ratio, n_pages] scan output
+        self._qd_cache = None                     # hoisted constants for _query_device
         self.last_insert = None                   # (np.int32 [H,m], np.int32 [H,m])
 
         self.build_seconds = 0.0
@@ -659,6 +661,37 @@ class PageScan:
         self.query_seconds.append(perf_counter() - start)
         return out
 
+    def _query_constants(self, H, budget, ratio):
+        """Hoisted per-call constants for :meth:`_query_device`, rebuilt on staleness.
+
+        ``ar``, ``rows`` and ``first`` depend only on ``(H, budget, ratio,
+        n_pages)``, all of which are fixed once the address space is reserved;
+        ``_query_device`` rebuilt all three on every call, and the query runs 12
+        anchor layers per token, so the allocation shows up. ``first`` is *not*
+        constant across calls -- ``scatter_reduce_("amin")`` reduces *into* the
+        buffer, so a stale smaller value from an earlier call would survive and
+        the caller re-arms it with the sentinel instead. The mask is derived
+        from ``_bias_t``, which :meth:`insert` mutates in place, so it is keyed
+        on ``_bias_ver`` rather than on the tensor identity alone.
+        """
+        c = self._qd_cache
+        W = budget * ratio
+        if (c is not None and c["H"] == H and c["W"] == W
+                and c["n_pages"] == self.n_pages and c["bias"] is self._bias_t
+                and c["ver"] == self._bias_ver):
+            return c
+        c = {
+            "H": H, "W": W, "n_pages": self.n_pages, "bias": self._bias_t,
+            "ver": self._bias_ver,
+            "mask": self._bias_t.unsqueeze(1) != 0,
+            "ar": torch.arange(W, device=self.device).expand(H, W),
+            "rows": torch.arange(H, device=self.device).unsqueeze(1).expand(H, W),
+            "first": torch.zeros((H, self.n_pages), dtype=torch.long,
+                                 device=self.device),
+        }
+        self._qd_cache = c
+        return c
+
     def _query_device(self, q, budget, ratio):
         """Device-side scan: ``bmm`` + ``topk`` + an order-preserving dedup.
 
@@ -679,6 +712,8 @@ class PageScan:
         else:
             qr = torch.as_tensor(np.ascontiguousarray(q, dtype=np.float32),
                                  device=self.device).reshape(H, ratio, self.head_dim)
+        c = self._query_constants(H, budget, ratio)
+        W = c["W"]
         with torch.no_grad():
             scores = torch.bmm(qr, self._reps_t.transpose(1, 2))    # [H, ratio, n_pages]
             # Mask, never add: unbuilt columns have an all-zero representative,
@@ -690,20 +725,24 @@ class PageScan:
             # are -inf for any input. The numpy path is structurally immune (it
             # never computes the unbuilt columns at all), so the two backends
             # could disagree only when this one was wrong.
-            scores = scores.masked_fill(self._bias_t.unsqueeze(1) != 0, float("-inf"))
+            scores = scores.masked_fill(c["mask"], float("-inf"))
             top = scores.topk(budget, dim=-1).indices               # [H, ratio, budget]
-            flat = top.transpose(1, 2).reshape(H, -1)               # [H, budget*ratio]
+            flat = top.transpose(1, 2).reshape(H, W)                # [H, budget*ratio]
 
             # Order-preserving first-unique: mark each page id's first
             # occurrence across the interleaved candidates, then gather them in
             # candidate order. torch.unique would sort and lose the ranking.
-            ar = torch.arange(flat.shape[1], device=self.device).expand_as(flat)
-            first = torch.full((H, self.n_pages), flat.shape[1],
-                               dtype=torch.long, device=self.device)
+            ar = c["ar"]
+            first = c["first"]
+            # scatter_reduce_("amin") *reduces into* `first`, it does not write
+            # it, so the buffer must be re-armed with the sentinel every call --
+            # otherwise an earlier call's smaller rank survives at a page id
+            # this call did not rank, and `keep` marks a non-first occurrence.
+            first.fill_(W)
             first.scatter_reduce_(1, flat, ar, reduce="amin")
             keep = first.gather(1, flat) == ar          # True only at a first occurrence
             pos = keep.cumsum(1) - 1                    # meaningful only where keep
-            rows = torch.arange(H, device=self.device).unsqueeze(1).expand_as(flat)
+            rows = c["rows"]
             # Write ONLY the genuine first occurrences, and only those landing
             # inside the budget. A repeat occurrence shares an output slot with
             # the next first occurrence, and scattering two values to the same
@@ -852,6 +891,7 @@ class PageScan:
                     r, kk = np.nonzero(pages >= old_n_built[:, None])
                     if r.size:
                         self._bias_t[r, pages[r, kk]] = float("-inf")
+                        self._bias_ver += 1
                 raise
 
         # Refresh the device mirror for the rows this flush changed.
@@ -868,6 +908,7 @@ class PageScan:
             if published.any():
                 r, c = np.nonzero(published)
                 self._bias_t[r, pages[r, c]] = 0.0
+                self._bias_ver += 1
         self.last_insert = (pages, slots)
         self.insert_seconds.append(perf_counter() - start)
         return pages, slots
