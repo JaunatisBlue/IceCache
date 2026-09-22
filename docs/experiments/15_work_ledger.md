@@ -130,6 +130,23 @@ glibc 给每个 32 MB 块 mmap，那次释放是 **68 次 munmap，实测占 159
 
 **顺带纠正一个曾把这条线判死的前提：尾巴没有衰减，省的每一毫秒都是一毫秒 TTFT**（见第四部分）。
 
+### 10. decode 查询路径：别名化 + 去 nonzero + query 常驻设备 — `6a229dc`（合并 `257e0d8`，报告 `18_`）
+
+**TPOT −4.25 ms/token（88.910 → 84.659 ms，比值 0.9522，95% CI [−6.430, −2.072]），
+9/9 配对全负，两臂范围不相交，每个配对都是 40/40 逐字段相同。**
+
+四处改动：query 对 page_scan 留在设备上（不再 D2H 下去又 H2D 回来）；别名层的
+`nr`/`rids` 不再 `clone()`；`_query_constants` 不再缓存 mask；`_scan_ops` 把会降级成
+**三次 `torch.nonzero`**（每次都要 host 同步定输出大小）的布尔 scatter 换成「写进 `budget+1` 列再切片」。
+
+**合并前由独立 agent 逐条反驳式验证**，最狠的一条是别名化——22 个别名层链式传递 `prev_nr`/`prev_rids`，
+任何原地写都会沿链放大。结论：穷举静态追踪 + 运行时审计（336 张量快照 / 308 次别名 recall，**0 异常**），
+`recall()` 在别名路径上根本不求值这两个参数，别名永远到不了 `_apply_selected_pages`，**那两个 `clone()` 是语义空操作**。
+`_scan_ops` 与原序列在 **14/14** 用例上等价（含 all-reject、重复 id、`pos>budget`）。
+
+**★ 对作者归因的更正**：收益的最大单项**不是** D2H 消除（0.710 ms/token，仅 17%），
+而是**去 nonzero（1.31 ms/token）**；隔离探针合计只解释 ~60% 的 live 效应。
+
 ---
 
 ## 第二部分 · 失败的探索（**不要重试，除非有新证据**）
@@ -284,14 +301,20 @@ glibc 给每个 32 MB 块 mmap，那次释放是 **68 次 munmap，实测占 159
 **这一节现在是 §12.2 的正面回答：decode 速度轴直接测得 1.14–1.21x，站得住；
 但它没有让端到端变快，原因就是上面那个算术，不是实现问题。**
 
-> ⚠ **本节的数字已经过期（2026-09-23）。** `67428de`（stash 复用）之后，
-> page_scan 的 TTFT 少了 **~0.3 s**，而**这段代码在 `infer_state.py:685` 的
-> `retrieval_backend == "page_scan"` 门之下，DCI 臂根本不付它**——所以这一刀
-> **直接收窄 page_scan vs DCI 的差距**，不是两边共享的开销。
-> 粗算：TTFT 差 0.5337 s − 0.3 ≈ **0.23 s**，`total_s` 差 0.5436 s − 0.3 ≈ **0.24 s**，
-> 即比值从 1.147 掉到约 **1.06**——**仍然后，但已经不是「怎么都追不上」的量级了。**
-> **这是一次推算，不是测量**：要引用必须在本节同一套交错协议下重测（8 配对、一臂一进程、`quiet-run.sh`）。
-> 在此之前，引用 `16_` 的数字时**必须**注明它测的是 `5eaa622` 那棵树。
+> ⚠ **本节的数字已经过期（2026-09-23），两条线各削一刀。**
+>
+> 1. **TTFT / `total_s`：`67428de`（stash 复用）** 让 page_scan 的 TTFT 少了 **~0.3 s**，
+>    而这段代码在 `infer_state.py:685` 的 `retrieval_backend == "page_scan"` 门之下，
+>    **DCI 臂根本不付它**——所以它**直接收窄 page_scan vs DCI 的差距**，不是两边共享的开销。
+>    粗算：TTFT 差 0.5337 − 0.3 ≈ **0.23 s**，`total_s` 差 0.5436 − 0.3 ≈ **0.24 s**，
+>    即 **1.147 → 约 1.06**——**仍然后，但已经不是「怎么都追不上」的量级了。**
+> 2. **TPOT：`257e0d8`（decode 查询路径）** 让 page_scan 的 TPOT 又降了 **4.8%**（0.9522，已验证）。
+>    DCI 臂同样不受影响，所以 decode 比值粗算从 0.813 到 **约 0.774**。
+>
+> **这两条都是推算，不是测量。** 要引用必须在本节同一套交错协议下重测
+> （8 配对、两种臂序、一臂一进程、`quiet-run.sh`、`--threads 64`）。
+> 在此之前，引用 `16_` 的任何数字时**必须**注明它测的是 `5eaa622` 那棵树，
+> 而 `17_`/`18_` 的增量是在另外两棵树上独立验证的。
 
 **机制是自洽的，不是裸的计时差**：这两次测量同时取到了查询 p50——page_scan **0.7881 ms** vs
 DCI **2.0260 ms**，便宜 **2.57x**（而且 page_scan 每 token 还**多发 3.9%** 的查询）。
@@ -355,6 +378,7 @@ TPOT 已经领先 1.23x，而 `total_s` 现在还是负的。
 | 第 4 轮 staging / decode / prefill | `docs/experiments/12_` `13_` `14_*.md` |
 | **★ §12.2 正面对决：page_scan vs DCI 直接测** | **`docs/experiments/16_merged_head_to_head.md`** |
 | **page_scan 的 TTFT 尾巴：stash 复用 + H2D 直推** | **`docs/experiments/17_page_scan_tail.md`**（改动 `d86be89`，**已合并** `67428de`） |
+| **decode 查询路径：别名化 + 去 nonzero** | **`docs/experiments/18_page_scan_decode_query.md`**（改动 `6a229dc`，**已合并** `257e0d8`） |
 | 早期报告 01–10 | 仅本机 `experiment/`，未入库 |
 | 第 1 轮三条否决分支 | tag `archive/explore-{batch-knn,pag-prefill,logsumexp}` 上的 `REPORT.md`（**不在 `algorithm` 上**） |
 | 分支 A / C 报告 | tag `archive/explore-recursive-split`、`archive/explore-adaptive-pages` 上的 `REPORT.md` |
