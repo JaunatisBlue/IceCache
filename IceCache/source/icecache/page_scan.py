@@ -664,15 +664,18 @@ class PageScan:
     def _query_constants(self, H, budget, ratio):
         """Hoisted per-call constants for :meth:`_query_device`, rebuilt on staleness.
 
-        ``ar``, ``rows`` and ``first`` depend only on ``(H, budget, ratio,
-        n_pages)``, all of which are fixed once the address space is reserved;
-        ``_query_device`` rebuilt all three on every call, and the query runs 12
-        anchor layers per token, so the allocation shows up. ``first`` is *not*
-        constant across calls -- ``scatter_reduce_("amin")`` reduces *into* the
-        buffer, so a stale smaller value from an earlier call would survive and
-        the caller re-arms it with the sentinel instead. The mask is derived
-        from ``_bias_t``, which :meth:`insert` mutates in place, so it is keyed
-        on ``_bias_ver`` rather than on the tensor identity alone.
+        ``ar`` and ``first`` depend only on ``(H, budget, ratio, n_pages)``, all
+        of which are fixed once the address space is reserved; ``_query_device``
+        rebuilt both on every call, and the query runs 12 anchor layers per
+        token, so the allocation shows up. ``first`` is *not* constant across
+        calls -- ``scatter_reduce_("amin")`` reduces *into* the buffer, so a
+        stale smaller value from an earlier call would survive and the caller
+        re-arms it with the sentinel instead. The built/unbuilt mask is not
+        cached here: it is a derived view of ``_bias_t``, which :meth:`insert`
+        writes in place, so caching it makes correctness depend on every write
+        site remembering to bump ``_bias_ver``. ``_scan_ops`` derives it per
+        call instead -- one comparison on an ``[H, 1, n_pages]`` broadcast
+        against tensors already in register -- and cannot go stale.
         """
         c = self._qd_cache
         W = budget * ratio
@@ -683,9 +686,7 @@ class PageScan:
         c = {
             "H": H, "W": W, "n_pages": self.n_pages, "bias": self._bias_t,
             "ver": self._bias_ver,
-            "mask": self._bias_t.unsqueeze(1) != 0,
             "ar": torch.arange(W, device=self.device).expand(H, W),
-            "rows": torch.arange(H, device=self.device).unsqueeze(1).expand(H, W),
             "first": torch.zeros((H, self.n_pages), dtype=torch.long,
                                  device=self.device),
         }
@@ -705,6 +706,16 @@ class PageScan:
         caller supplies it on the CPU) and the device->host copy of the
         ``[H, budget]`` result; the latter synchronises the stream. See the module
         docstring for the tie-breaking caveat against the numpy path.
+
+        The op sequence lives in :meth:`_scan_ops`, which is kept free of host
+        round trips and of `torch.nonzero` so that it *can* be captured as a
+        CUDA graph. It should not be, at these row lengths: a capture of this
+        sequence costs ~107 ms on this box (measured with a warm allocator, and
+        unchanged by sharing one graph pool), while the replay it replaces is
+        0.186 ms/call against 0.772 ms/call eager -- 0.59 ms saved per call, so
+        a capture needs ~180 calls on the *same* ``_reps_t``/``n_pages`` to pay
+        for itself. Both change every LongBench row, so a capture is thrown away
+        long before then. Revisit for generations in the thousands of tokens.
         """
         H = self.n_kv_heads
         if isinstance(q, torch.Tensor):
@@ -713,46 +724,65 @@ class PageScan:
             qr = torch.as_tensor(np.ascontiguousarray(q, dtype=np.float32),
                                  device=self.device).reshape(H, ratio, self.head_dim)
         c = self._query_constants(H, budget, ratio)
-        W = c["W"]
         with torch.no_grad():
-            scores = torch.bmm(qr, self._reps_t.transpose(1, 2))    # [H, ratio, n_pages]
-            # Mask, never add: unbuilt columns have an all-zero representative,
-            # so the bmm scores them 0.0, and `scores + -inf` erases that only
-            # while the score is finite. A non-finite q makes the product NaN
-            # (inf * 0), `NaN + -inf` is still NaN, and topk ranks NaN first --
-            # which returned page ids >= n_built, i.e. pages whose K/V was never
-            # written. masked_fill overwrites unconditionally, so unbuilt columns
-            # are -inf for any input. The numpy path is structurally immune (it
-            # never computes the unbuilt columns at all), so the two backends
-            # could disagree only when this one was wrong.
-            scores = scores.masked_fill(c["mask"], float("-inf"))
-            top = scores.topk(budget, dim=-1).indices               # [H, ratio, budget]
-            flat = top.transpose(1, 2).reshape(H, W)                # [H, budget*ratio]
+            return self._scan_ops(qr, c, budget, ratio).cpu().numpy()
 
-            # Order-preserving first-unique: mark each page id's first
-            # occurrence across the interleaved candidates, then gather them in
-            # candidate order. torch.unique would sort and lose the ranking.
-            ar = c["ar"]
-            first = c["first"]
-            # scatter_reduce_("amin") *reduces into* `first`, it does not write
-            # it, so the buffer must be re-armed with the sentinel every call --
-            # otherwise an earlier call's smaller rank survives at a page id
-            # this call did not rank, and `keep` marks a non-first occurrence.
-            first.fill_(W)
-            first.scatter_reduce_(1, flat, ar, reduce="amin")
-            keep = first.gather(1, flat) == ar          # True only at a first occurrence
-            pos = keep.cumsum(1) - 1                    # meaningful only where keep
-            rows = c["rows"]
-            # Write ONLY the genuine first occurrences, and only those landing
-            # inside the budget. A repeat occurrence shares an output slot with
-            # the next first occurrence, and scattering two values to the same
-            # (row, slot) is undefined on CUDA -- it silently emitted a duplicate
-            # page id and dropped a distinct one. `pos[keep]` is strictly
-            # increasing per row, so the surviving indices are distinct.
-            m = keep & (pos < budget)
-            out = torch.zeros((H, budget), dtype=torch.long, device=self.device)
-            out[rows[m], pos[m]] = flat[m]
-            return out.to(torch.int32).cpu().numpy()
+    def _scan_ops(self, qr, c, budget, ratio):
+        """The scan as a straight-line op sequence, with no host round trip.
+
+        ``qr`` is the float32 ``[H, ratio, head_dim]`` query already on the
+        device; the result is an int32 ``[H, budget]`` device tensor.
+        """
+        H = self.n_kv_heads
+        W = c["W"]
+        scores = torch.bmm(qr, self._reps_t.transpose(1, 2))    # [H, ratio, n_pages]
+        # Mask, never add: unbuilt columns have an all-zero representative,
+        # so the bmm scores them 0.0, and `scores + -inf` erases that only
+        # while the score is finite. A non-finite q makes the product NaN
+        # (inf * 0), `NaN + -inf` is still NaN, and topk ranks NaN first --
+        # which returned page ids >= n_built, i.e. pages whose K/V was never
+        # written. masked_fill overwrites unconditionally, so unbuilt columns
+        # are -inf for any input. The numpy path is structurally immune (it
+        # never computes the unbuilt columns at all), so the two backends
+        # could disagree only when this one was wrong. `_bias_ver` is not
+        # consulted: `insert` writes `_bias_t` in place, and deriving the mask
+        # from it here is both cheaper than a cached copy that has to be
+        # invalidated per write and impossible to leave stale.
+        scores = scores.masked_fill(self._bias_t.unsqueeze(1) != 0, float("-inf"))
+        top = scores.topk(budget, dim=-1).indices               # [H, ratio, budget]
+        flat = top.transpose(1, 2).reshape(H, W)                # [H, budget*ratio]
+
+        # Order-preserving first-unique: mark each page id's first
+        # occurrence across the interleaved candidates, then gather them in
+        # candidate order. torch.unique would sort and lose the ranking.
+        ar = c["ar"]
+        first = c["first"]
+        # scatter_reduce_("amin") *reduces into* `first`, it does not write
+        # it, so the buffer must be re-armed with the sentinel every call --
+        # otherwise an earlier call's smaller rank survives at a page id
+        # this call did not rank, and `keep` marks a non-first occurrence.
+        first.fill_(W)
+        first.scatter_reduce_(1, flat, ar, reduce="amin")
+        keep = first.gather(1, flat) == ar          # True only at a first occurrence
+        pos = keep.cumsum(1) - 1                    # meaningful only where keep
+        # Write ONLY the genuine first occurrences, and only those landing
+        # inside the budget. A repeat occurrence shares an output slot with
+        # the next first occurrence, and scattering two values to the same
+        # (row, slot) is undefined on CUDA -- it silently emitted a duplicate
+        # page id and dropped a distinct one. `pos[keep]` is strictly
+        # increasing per row, so the surviving indices are distinct.
+        #
+        # The rejects are aimed at a padding column one past the budget and
+        # sliced off, rather than filtered with `out[rows[m], pos[m]] = flat[m]`.
+        # That boolean form lowered to three `torch.nonzero` calls, and a
+        # `nonzero` on CUDA sizes its output with a host synchronisation -- it
+        # was ~40% of the scan's kernels, and it is also the one op here that a
+        # CUDA graph cannot capture.
+        idx = pos.masked_fill(~keep, budget).clamp_(max=budget)
+        src = flat.masked_fill(idx >= budget, 0)
+        out = torch.zeros((H, budget + 1), dtype=torch.long, device=self.device)
+        out.scatter_(1, idx, src)
+        return out[:, :budget].to(torch.int32)
 
     # ----------------------------------------------------------------- insert
 

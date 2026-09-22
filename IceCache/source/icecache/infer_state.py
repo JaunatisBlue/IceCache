@@ -1184,17 +1184,15 @@ class InferState:
                 # shape assert in _apply_selected_pages uses this same
                 # expression (spec section 6b, C3). No DCI state is touched.
                 query_start = perf_counter()
-                # Pass the tensor through: PageScan's device scan copies it to
-                # the GPU itself, so a numpy() conversion here would be a no-op
-                # view on an already-CPU tensor -- it buys nothing and is not
-                # what the scan's cost consists of. The real transfers are the
-                # host->device copy of `q` and the device->host copy of the
-                # result, and the latter synchronises the stream, so
-                # query_seconds["page_scan"] includes whatever was already
-                # queued. (An earlier comment here cited "1.91 vs 0.61 ms" for
-                # this conversion; that measurement is not reproducible from
-                # this call path, because `query_states` arrives here already
-                # on the CPU -- see the `.cpu()` at the _DCI_query call site.)
+                # Pass the tensor through: `query_states` arrives on the device
+                # (see the call site, which skips the DCI path's `.cpu()`), the
+                # scan runs on the device, and only the `[H, budget]` result
+                # comes back. That result copy is an implicit stream
+                # synchronisation, so query_seconds["page_scan"] includes
+                # whatever was already queued rather than being a pure scan
+                # latency. (An earlier comment here cited "1.91 vs 0.61 ms" for
+                # a numpy() conversion; that measurement is not reproducible
+                # from this call path.)
                 _query = query_states.reshape(-1, self.head_dim).float()
                 page_ids = self.page_scans[cur_id].query(_query, num_neighbours)
                 self.query_seconds["page_scan"].append(perf_counter() - query_start)
@@ -1442,8 +1440,16 @@ class InferState:
             for i in range(kvc.batch_size):
 
                 if reuse_id == 0:
-                    eids, rids, nr = self._DCI_query(
-                        i, layer_idx, query_states[i].cpu().detach().transpose(0, 1))
+                    # The query stays on the device for page_scan: its scan runs
+                    # on the GPU and opens by casting the query to float32 there,
+                    # so a `.cpu()` here is a stream synchronisation plus a D2H
+                    # that the very next line copies straight back. `_DCI_query`
+                    # takes it on the host because the DCI backend needs numpy,
+                    # so only that backend pays the round trip.
+                    q_arg = query_states[i].detach().transpose(0, 1)
+                    if self.retrieval_backend != "page_scan":
+                        q_arg = q_arg.cpu()
+                    eids, rids, nr = self._DCI_query(i, layer_idx, q_arg)
 
                     self.prev_nr = nr
                     self.prev_eids = eids
@@ -1463,8 +1469,14 @@ class InferState:
                     # two launches instead of four, no index tensors.
                     eids = torch.where(self.prev_eids != -1,
                                        self.prev_eids + offset, self.prev_eids)
-                    nr = self.prev_nr.clone()
-                    rids = self.prev_rids.clone()
+                    # Aliased, not cloned. `recall(..., source=reuse_id)` reads
+                    # its rids/nr out of `_recall_cpu[source]` and never touches
+                    # the arguments, so the two `clone()`s were 44 launches and
+                    # two allocations per token carrying nothing. Nothing
+                    # downstream writes them either: an alias layer never
+                    # reaches `_apply_selected_pages`.
+                    nr = self.prev_nr
+                    rids = self.prev_rids
                     assert eids is not None and nr is not None and rids is not None
 
                 if eids is not None:
