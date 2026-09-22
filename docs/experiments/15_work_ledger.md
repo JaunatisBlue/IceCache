@@ -285,10 +285,10 @@ TPOT 已经领先 1.23x，而 `total_s` 现在还是负的。
 | 第 4 轮 staging / decode / prefill | `docs/experiments/12_` `13_` `14_*.md` |
 | **★ §12.2 正面对决：page_scan vs DCI 直接测** | **`docs/experiments/16_merged_head_to_head.md`** |
 | 早期报告 01–10 | 仅本机 `experiment/`，未入库 |
-| 第 1 轮三条否决分支 | 分支 `explore/{batch-knn,pag-prefill-clustering,logsumexp-retrieval}` 的 `REPORT.md`（**不在 `algorithm` 上**），tag `archive/explore-*` |
-| 分支 A / C 报告 | `explore/recursive-split`、`explore/adaptive-pages` |
-| n=200 决定性准确率 A/B | `explore/accuracy-200`（`7d8ee55`） |
-| 原始 jsonl | `/home/yx/.claude/jobs/497cc41a/tmp/`、`/tmp/pagprobe/` |
+| 第 1 轮三条否决分支 | tag `archive/explore-{batch-knn,pag-prefill,logsumexp}` 上的 `REPORT.md`（**不在 `algorithm` 上**） |
+| 分支 A / C 报告 | tag `archive/explore-recursive-split`、`archive/explore-adaptive-pages` 上的 `REPORT.md` |
+| n=200 决定性准确率 A/B | tag `archive/explore-accuracy-200`（`7d8ee55`）；行级 jsonl 见下面「原始 jsonl」 |
+| 原始 jsonl | `/home/yx/.claude/jobs/497cc41a/tmp/`、`/tmp/pagprobe/`；n=200 准确率即 `/tmp/pagprobe/acc200_fixed_r3_t64.jsonl`（前 200 行 DCI、后 200 行 page_scan）。这两处都是**临时目录**，不在版本控制里，`/tmp` 被清理即丢失——重要结论请引用本仓库的 `docs/experiments/` |
 
 ### 分支清单（`explore/*` 已全部删除，历史靠 tag 保留）
 
