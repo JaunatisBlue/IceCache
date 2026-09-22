@@ -253,3 +253,22 @@ end-to-end 指标约 90% 是精确并列，哪几行翻转不是任何检索指�
 | 分支 A / C 报告 | `explore/recursive-split`、`explore/adaptive-pages` |
 | n=200 决定性准确率 A/B | `explore/accuracy-200`（`7d8ee55`） |
 | 原始 jsonl | `/home/yx/.claude/jobs/497cc41a/tmp/`、`/tmp/pagprobe/` |
+
+### 分支清单
+
+以下是全部探索分支的归宿。worktree 目录已在本轮清理，**分支和 commit 一个都没删**，
+仍然可以直接 `git show <sha>` 或 `git checkout <branch>` 取回。
+
+| 分支 | SHA | 已进 `algorithm`？ | 内容 |
+|---|---|---|---|
+| `explore/exact-greedy-fast` | `23ee679` | ✅ 已合 | 分支 D — 逐位相同的贪心加速（报告 `11_`） |
+| `explore/staging-fast` | `aed15bb` | ✅ 已合 | 共享 staging 裁剪（报告 `12_`） |
+| `explore/decode-fast` | `840a10a` | ✅ 已合 | page_scan 查询常量提升（报告 `13_`） |
+| `explore/prefill-fast` | `cd74dce` | ✅ 已合 | prefill 卸载拷贝（报告 `14_`） |
+| `explore/recursive-split` | `3923347` | ❌ 未合 | 第 2 轮分支 A，报告在其 `REPORT.md` |
+| `explore/adaptive-pages` | `ec6188f` | ❌ 未合 | 第 2 轮分支 C，报告在其 `REPORT.md` |
+| `explore/page-size-8` | `2abde20` | ❌ 未合 | 分支 E — page_size=8 在 n=200 上是 null |
+| `explore/accuracy-200` | `7d8ee55` | ❌ 未合 | n=200 决定性准确率 A/B，**数据保留，别删** |
+| `explore/batch-knn` | `016746c` | ❌ 未合 | 第 1 轮否决，另打 tag `archive/explore-batch-knn` |
+| `explore/pag-prefill-clustering` | `aba557c` | ❌ 未合 | 第 1 轮否决，另打 tag `archive/explore-pag-prefill` |
+| `explore/logsumexp-retrieval` | `9602df2` | ❌ 未合 | 第 1 轮否决，另打 tag `archive/explore-logsumexp` |
