@@ -114,6 +114,22 @@ base1 0.8314 → opt 0.7709 → base2 0.8469 ms，168/200，p=9e-24；同代码�
   CUDA 上是未定义的——实测发出重复页号并丢掉一个不同页号（需要 12 个唯一 id 只给出 11 个），准确率腰斩到 0.1482。
   合成随机键几乎从不碰撞，真实键经常碰撞，所以单元测试通过了。
 
+### 9. page_scan 尾巴的 stash 复用 + H2D 直推 — `d86be89`（合并 `67428de`，报告 `17_`）
+
+**TTFT −200…−390 ms（中心 ≈ −300），40 行 × 4 次启动 = 160 条记录逐字段相同（0 处不同）。**
+
+改动的不是算法而是**谁在付释放成本**：每个 build 层的 K/V 原本 `k.clone()/v.clone()`，
+16k prompt 下是 68 个张量 / 2.2 GB；分配藏在 worker 线程上，**释放没有**——
+最后一个引用死在 `_page_scan_flush` 返回时，也就是主线程、TTFT 尾巴里，
+glibc 给每个 32 MB 块 mmap，那次释放是 **68 次 munmap，实测占 1591 ms 尾巴里的 332 ms**。
+改成**跨 prompt 复用的 pageable host 缓冲**；flush 也从 `torch.cat(...).to(device)`
+改成每个 builder 一次 `copy_(non_blocking=True)` 直推进复用设备缓冲。
+
+**代价必须声明：常驻内存 floor `VmRSS` +4.15 GiB**（峰值 `VmHWM` 反而低 500 MB）——
+它把「每问一份工作集」变成「永久一份工作集」。在 156 GB 的机器上不阻塞，但不是免费。
+
+**顺带纠正一个曾把这条线判死的前提：尾巴没有衰减，省的每一毫秒都是一毫秒 TTFT**（见第四部分）。
+
 ---
 
 ## 第二部分 · 失败的探索（**不要重试，除非有新证据**）
@@ -329,7 +345,7 @@ TPOT 已经领先 1.23x，而 `total_s` 现在还是负的。
 | 分支 D | `docs/experiments/11_exact_greedy_fast.md` |
 | 第 4 轮 staging / decode / prefill | `docs/experiments/12_` `13_` `14_*.md` |
 | **★ §12.2 正面对决：page_scan vs DCI 直接测** | **`docs/experiments/16_merged_head_to_head.md`** |
-| **page_scan 的 TTFT 尾巴：stash 复用 + H2D 直推** | **`docs/experiments/17_page_scan_tail.md`**（改动 `d86be89`，**待合并**） |
+| **page_scan 的 TTFT 尾巴：stash 复用 + H2D 直推** | **`docs/experiments/17_page_scan_tail.md`**（改动 `d86be89`，**已合并** `67428de`） |
 | 早期报告 01–10 | 仅本机 `experiment/`，未入库 |
 | 第 1 轮三条否决分支 | tag `archive/explore-{batch-knn,pag-prefill,logsumexp}` 上的 `REPORT.md`（**不在 `algorithm` 上**） |
 | 分支 A / C 报告 | tag `archive/explore-recursive-split`、`archive/explore-adaptive-pages` 上的 `REPORT.md` |
