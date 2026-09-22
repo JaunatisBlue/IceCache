@@ -242,6 +242,14 @@ class InferState:
         self.prev_nr = None
         self.prev_eids = None
         self.prev_rids = None
+        # Decode-time staging caches, written by each reuse group's anchor
+        # layer and read by that group's aliases within the same token:
+        # `_recall_cpu` holds the anchor's rids/nr already copied to the host,
+        # `page_valid_cache` its `get_valid_entries` result. Both mirror
+        # `prev_eids`/`prev_rids`/`prev_nr` and describe the current token only
+        # -- the anchor replaces them before any alias can read them.
+        self._recall_cpu = {}
+        self.page_valid_cache = {}
         self.prev_index = None
         self.prev_offset = None
 
@@ -394,6 +402,14 @@ class InferState:
         self.prev_nr = None
         self.prev_eids = None
         self.prev_rids = None
+        # Decode-time staging caches, written by each reuse group's anchor
+        # layer and read by that group's aliases within the same token:
+        # `_recall_cpu` holds the anchor's rids/nr already copied to the host,
+        # `page_valid_cache` its `get_valid_entries` result. Both mirror
+        # `prev_eids`/`prev_rids`/`prev_nr` and describe the current token only
+        # -- the anchor replaces them before any alias can read them.
+        self._recall_cpu = {}
+        self.page_valid_cache = {}
         self.prev_index = None
         self.prev_offset = None
         self.n_offloaded_win_caches = None
@@ -1332,7 +1348,26 @@ class InferState:
             self.layout,
         )
 
-    def recall(self, layer_idx: int, b: int, rids: Tensor, nr: Tensor):
+    def recall(self, layer_idx: int, b: int, rids: Tensor, nr: Tensor, source: int = 0):
+        """Stage one layer's recalled pages into ``cpu_transit_buffer``.
+
+        ``source`` is the layer whose retrieval produced ``rids``/``nr``: 0 for
+        an anchor layer, and the anchor's layer id for an alias. Alias layers
+        receive the anchor's arrays *cloned verbatim* (``estimate_select_recall``
+        below), so the two D2H copies and the element count are identical across
+        every call of a reuse group -- they are computed once at the anchor and
+        read back here. That also removes the ``torch.sum(nr).item()`` device
+        sync, whose value is exactly the CPU element count ``counter``, and the
+        reader should note the two were already required to agree: the old code
+        used the synced GPU sum for ``offset_t`` and the CPU count for
+        ``list_size``.
+
+        The address gather itself cannot be shared: ``page_address_buffer`` is
+        per layer, so an alias's addresses genuinely differ from its anchor's.
+        It is one vectorised numpy gather rather than a per-head Python loop --
+        measured 369 us -> 31 us per call at H=8, since the loop's cost was
+        numpy fancy-indexing overhead, not the 80 elements it copies.
+        """
         thread_id = threading.get_ident()
         if hasattr(self, '_thread_locals') and thread_id in self._thread_locals:
             thread_local = self._thread_locals[thread_id]
@@ -1342,15 +1377,26 @@ class InferState:
             # Fallback to main thread CUDA objects
             c2g_stream = self.c2g_stream
 
-        n_transit_pages = torch.sum(nr).item()
+        if source:
+            rids_cpu, nr_cpu, counter = self._recall_cpu[source]
+        else:
+            rids_cpu = rids.cpu().numpy()
+            nr_cpu = nr.cpu().numpy()
+            counter = int(nr_cpu.sum())
+            self._recall_cpu[layer_idx] = (rids_cpu, nr_cpu, counter)
+        n_transit_pages = counter
 
-        rids_cpu = rids.cpu()
-        nr_cpu = nr.cpu()
-
-        counter = 0
-        for i in range(self.n_kv_heads):
-            self._src_address_buffer[counter:counter+nr_cpu[i].item()] = self.page_address_buffer[layer_idx][b, i, rids_cpu[i, :nr_cpu[i]]]
-            counter += nr_cpu[i].item()
+        max_n = int(nr_cpu.max())
+        if max_n > 0:
+            # Head i contributes rids_cpu[i, :nr_cpu[i]], in head order. Gather
+            # the full [H, max_n] block, then drop the columns past each head's
+            # count -- masking them to 0 first, because the unused tail of a
+            # rids row holds whatever the selector left there and would
+            # otherwise index out of range.
+            keep = np.arange(max_n)[None, :] < nr_cpu[:, None]
+            flat = self.page_address_buffer[layer_idx][b][
+                np.arange(self.n_kv_heads)[:, None], np.where(keep, rids_cpu[:, :max_n], 0)][keep]
+            self._src_address_buffer[:counter] = flat
 
         with torch.cuda.stream(c2g_stream):
 
@@ -1361,7 +1407,6 @@ class InferState:
                                dim=self.head_dim, page_size=self.page_size*self.head_dim, dtype=0)
         ############################################################
 
-        with torch.cuda.stream(c2g_stream):
             dst = self.cuda_transit_buffer[:, : 2 * n_transit_pages, :]
             src = self.cpu_transit_buffer[:, : 2 * n_transit_pages, :]
             dst.copy_(src, non_blocking=True)
@@ -1390,41 +1435,59 @@ class InferState:
 
         if kvc.n_real_pages == kvc.budget and self.use_dci:
             ns = kvc.n_sink_pages
+            reuse_id = self.check_reuse(layer_idx)
             for i in range(kvc.batch_size):
 
-                if self.check_reuse(layer_idx) == 0:
+                if reuse_id == 0:
                     eids, rids, nr = self._DCI_query(
                         i, layer_idx, query_states[i].cpu().detach().transpose(0, 1))
-                
+
                     self.prev_nr = nr
                     self.prev_eids = eids
                     self.prev_rids = rids
                 else:
-                    reuse_id = self.check_reuse(layer_idx)
+                    # Both the offset and the invariant it is derived from are
+                    # re-read every token, deliberately. Caching them once per
+                    # row is WRONG and changes the generated text: measured on
+                    # hotpotqa row 1, a cached offset turned "Charles Laughton"
+                    # into "Charles Dickens". `c2p[0, 0]` does move during decode
+                    # (for the anchor and its aliases together, which is why the
+                    # whole-row invariant below still holds either way), so the
+                    # alias's page ids depend on the live value.
                     offset = self.kv_caches[layer_idx].c2p[0, 0] - self.kv_caches[reuse_id].c2p[0, 0]
                     assert ((self.kv_caches[layer_idx].c2p - self.kv_caches[reuse_id].c2p) == offset).all()
-                    eids = self.prev_eids.clone()
-                    mask = self.prev_eids != -1
-                    eids[mask] += offset
+                    # where() instead of clone + masked index_add_: same values,
+                    # two launches instead of four, no index tensors.
+                    eids = torch.where(self.prev_eids != -1,
+                                       self.prev_eids + offset, self.prev_eids)
                     nr = self.prev_nr.clone()
                     rids = self.prev_rids.clone()
                     assert eids is not None and nr is not None and rids is not None
 
                 if eids is not None:
 
-                    self.recall(layer_idx, i, rids, nr)
+                    self.recall(layer_idx, i, rids, nr, reuse_id)
 
-                    if self.retrieval_backend == "page_scan":
-                        # True per-(page, head) occupancy, never -1 (spec 6b, C2/C5).
-                        source = layer_idx if self.check_reuse(layer_idx) == 0 else reuse_id
-                        self.page_valid_entries[layer_idx][ns: ns + self.n_dci_pages - self.layer2topk[layer_idx]] = torch.tensor(
-                            self.page_scans[source].get_valid_entries(self.selected_page_idx[source]), **self._i32).T
-                    elif self.check_reuse(layer_idx) == 0:
-                        self.page_valid_entries[layer_idx][ns: ns + self.n_dci_pages - self.layer2topk[layer_idx]] = torch.tensor(
-                            self.dci_db[layer_idx].get_valid_entries(self.selected_page_idx[layer_idx]), **self._i32).T
+                    # `get_valid_entries` is a per-(layer, token) function of the
+                    # selection, and an alias layer reads its anchor's selection
+                    # (`selected_page_idx[reuse_id]`), so the value an alias needs
+                    # is the one the anchor already computed this token. Anchors
+                    # always recompute, which is what keeps this fresh; the
+                    # difference is that an alias now copies its anchor's result
+                    # device-to-device instead of re-running the selector and
+                    # making a fresh pageable host->device transfer of it.
+                    if reuse_id == 0:
+                        if self.retrieval_backend == "page_scan":
+                            # True per-(page, head) occupancy, never -1 (spec 6b, C2/C5).
+                            entries = self.page_scans[layer_idx].get_valid_entries(self.selected_page_idx[layer_idx])
+                        else:
+                            entries = self.dci_db[layer_idx].get_valid_entries(self.selected_page_idx[layer_idx])
+                        entries = torch.tensor(entries, **self._i32)
+                        self.page_valid_cache[layer_idx] = entries
                     else:
-                        self.page_valid_entries[layer_idx][ns: ns + self.n_dci_pages - self.layer2topk[layer_idx]] = torch.tensor(
-                            self.dci_db[reuse_id].get_valid_entries(self.selected_page_idx[reuse_id]), **self._i32).T
+                        entries = self.page_valid_cache[reuse_id]
+
+                    self.page_valid_entries[layer_idx][ns: ns + self.n_dci_pages - self.layer2topk[layer_idx]] = entries.T
 
                 c2g_stream.synchronize()
 
