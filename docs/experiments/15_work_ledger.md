@@ -488,6 +488,18 @@ TPOT 已经领先 1.29x（0.7772），而 `total_s` 现在还是负的。
 | 分支 A / C 报告 | tag `archive/explore-recursive-split`、`archive/explore-adaptive-pages` 上的 `REPORT.md` |
 | n=200 决定性准确率 A/B | tag `archive/explore-accuracy-200`（`7d8ee55`）；行级 jsonl 见下面「原始 jsonl」 |
 | 原始 jsonl | `/home/yx/.claude/jobs/497cc41a/tmp/`、`/tmp/pagprobe/`；n=200 准确率即 `/tmp/pagprobe/acc200_fixed_r3_t64.jsonl`（前 200 行 DCI、后 200 行 page_scan）。这两处都是**临时目录**，不在版本控制里，`/tmp` 被清理即丢失——重要结论请引用本仓库的 `docs/experiments/` |
+| **正面对决 v2 的原始数据与驱动** | `/home/yx/.claude/jobs/497cc41a/tmp/h2h_c/`：`run_h2h.sh`（臂序 `ps1 dci1 dci2 ps2 ps3 dci3 dci4 ps4`、可续跑、1 Hz RSS 采样）、`analyze.py`、`full.txt`、8 个 `*.jsonl`。**同样是临时目录** |
+| **尾巴 `d86be89` 的验证工具链** | tag `archive/verify-tail2`（`5e3aa0f`）下的 `verification_tail2/`：10 个脚本 948 行，含带同码 null 的配对 A/B 驱动、RSS 采样、恒等式分析。**这是本项目测量协议的成文实现，值得复用** |
+
+### worktree 清理（2026-09-23）
+
+已删除 9 个已批准的 worktree：`tail`、`tail2`、`tail2base`、`audit`、`budget`、`cert-bound`、
+`dci-c`、`multirep`、`docs-fix`。**删除前每个都查过 `git status --porcelain`（全干净）
+和 `git log algorithm..HEAD`（`tail2` 有 1 个 commit 不在 `algorithm` 上，先补了 tag
+`archive/verify-tail2` 才删）。**
+
+保留中：`greedy-2nd`、`spec-seed`、`spec-base`、`write-c`、`tpot-decode`、`tpot-verify-base`。
+后三个已确认无独立 commit（`algorithm..<branch>` 为空），随时可清，只是还没清。
 
 ### 分支清单（`explore/*` 已全部删除，历史靠 tag 保留）
 
