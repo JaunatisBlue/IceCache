@@ -1,11 +1,49 @@
 # `explore/staging-fast` — trimming the shared decode staging in `estimate_select_recall`
 
+> ## ⚠ EFFECT-SIZE CORRECTION (2026-09-22, added after merge)
+>
+> **Do not quote this report's −22.3%.** An independent second party re-measured
+> this change on the merged tree, arm-interleaved over **13 arms in two row
+> blocks (40 + 120 rows)**, with the staging change as **its own arm inside the
+> same measurement window**. Its same-code nulls are much cleaner than this
+> report's (base-vs-base −1.96% / +2.64% / −2.63% / +0.04%, versus the −5.47%
+> one-sided null in §4):
+>
+> | arm | adjusted Δ TPOT |
+> |---|---|
+> | **staging alone** | **−13.27% to −14.85%** (34/6, 33/7) |
+> | full merge (staging + hoist + prefill) | −15.06% to −15.38% |
+> | merged − staging (= the decode hoist) | −0.69 ms (−0.79%), 30/10, p=2.2e-3 |
+>
+> **The honest magnitude is ~−14%; the three-branch merge is −15% ± 2.** The
+> merge is not what lost the effect — *this branch's own headline magnitude does
+> not reproduce in a cleaner window*. The dominant uncertainty is **between-window
+> spread of ~5.3 ms (~6%)**: this report's opt arm measured 82.1 ms absolute, the
+> re-measurement's staging-only arm measured **87.35 ms on identical code** —
+> larger than any within-window null it measured.
+>
+> **What survives unchanged:** the output identity (this report's §3) and the
+> *direction* of the effect. The re-measurement independently confirms the merge
+> is **additive** (staging ≈ −14%, hoist ≈ −1 pp, prefill ≈ −1.6 s TTFT and 0 on
+> TPOT → predicted ≈ −15%, measured −15%), with **no contention-sensitivity
+> amplification** (TPOT-on-query-p50 slope 0.083/0.092 merged vs 0.099/0.140 base)
+> and **no memory regression** (+133 MB, exactly the reused fp32 staging buffer).
+> Combined with the prefill branch, the merged tree was verified at
+> **2160/2160 row-comparisons text-, score- and token-identical** across all 13
+> arms, with same-code controls at 0 mismatches.
+>
+> The lesson, recorded here because it is new to this project: **a within-window
+> null only proves "A beats B in this window", never "the effect is this large".**
+> The fix is to run the thing under test as its own arm in an interleaved window
+> and across two row blocks — which is how this was caught. See
+> `experiment/15_work_ledger.md` §3 item 11.
+
 ## TL;DR
 
 The mission was to cut decode time by attacking the ~51 ms/token of staging in `estimate_select_recall`, **without changing a single output bit**.
 
 * The 51 ms nomination was **confirmed in magnitude but wrong in composition**. Re-measured in-scope staging is **~33.8 ms/token**, not 51; two of the four named components were overstated 2.2x and 2.4x, and the single largest in-scope item (the per-head Python gather loop, 8.5 ms) was not named at all.
-* The change removes **~11 ms/token of staging** (probe, same backend, per token) and measures **−22.3% TPOT on page_scan** (40 rows, 40/0/0, p=1.8e-12) and **−11.7% TPOT on DCI** (20 rows, 17/3/0, p=2.6e-3).
+* The change removes **~11 ms/token of staging** (probe, same backend, per token) and measures **−22.3% TPOT on page_scan** (40 rows, 40/0/0, p=1.8e-12) and **−11.7% TPOT on DCI** (20 rows, 17/3/0, p=2.6e-3). **⚠ The −22.3% does not reproduce: an independent 13-arm re-measurement puts it at ~−14%. Read the correction box at the top of this file first.**
 * **Output identity: 40/40 rows bit-identical on page_scan, text and score**, and the page_scan arm is *itself* deterministic (0/40 between two runs of the unmodified baseline).
 * The DCI arm's A/B showed 3/20 text mismatches — **but the DCI arm disagrees with itself on 4/20 rows between two runs of byte-identical baseline code**. Every one of the 3 A/B mismatch rows is a row the same code disagrees on with itself. The DCI identity check is therefore **uninformative at n=20, not failed**; the page_scan arm carries the correctness gate.
 
@@ -141,7 +179,7 @@ The DCI null is ~zero, so the −14 ms stands as measured. Best 5 rows: −49.5,
 
 The DCI arm cannot be certified at n=20 — not because the change fails, but because **the DCI path is intrinsically non-reproducible at ~10–20% of rows**. That is a pre-existing property of the backend, and it is the single most important thing this branch found: any future identity gate run on the DCI arm at this sample size is worthless. Use page_scan for correctness gates, or raise DCI's n well past 200 and report a mismatch *rate* against a same-code null.
 
-Effect size: **−22.3% page_scan TPOT** raw (40/0/0) and about **−17.7% net** of the measured run-order null; **−11.7% DCI TPOT** (17/3/0) against a ~zero null.
+Effect size: **−22.3% page_scan TPOT** raw (40/0/0) and about **−17.7% net** of the measured run-order null; **−11.7% DCI TPOT** (17/3/0) against a ~zero null. **⚠ Superseded — the independent re-measurement puts this at ~−14%. See the correction box at the top of this file before quoting either number.**
 
 Caveats I would not hide: the page_scan null is large (−5.8 ms, 29/11) and one-sided, so the page_scan number should be read as a range (−17.7% to −22.3%), not a point. TTFT is not claimed. All numbers are hotpotqa-only, n=20/40.
 
