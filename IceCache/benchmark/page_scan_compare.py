@@ -43,6 +43,13 @@ def arguments():
     parser.add_argument("--page-scan-write-threads", type=int, default=8,
                         help="Threads for the deferred CPU page writes "
                              "(default 8, ~5x on that loop); 1 = serial")
+    parser.add_argument("--page-scan-defer-write", type=int, default=0, choices=[0, 1],
+                        help="1 = submit the CPU page writes but join each "
+                             "layer's future at its first reader (recall), so "
+                             "they overlap the first decode step; 0 = join "
+                             "them in the flush (default). Byte-identical "
+                             "output either way; a no-op with "
+                             "--page-scan-write-threads 1")
     parser.add_argument("--n-reuse-layers", type=int, default=0,
                         help="Match run_longbench.sh production config by passing 3")
     parser.add_argument("--seed", type=int, default=42)
@@ -233,7 +240,8 @@ def run_backend(args, backend, samples, tokenizer, device, max_new_tokens, outpu
         pag_target_degree=args.pag_target_degree,
         pag_projection_levels=args.pag_projection_levels,
         page_scan_batch=bool(args.page_scan_batch),
-        page_scan_write_threads=args.page_scan_write_threads)
+        page_scan_write_threads=args.page_scan_write_threads,
+        page_scan_defer_write=bool(args.page_scan_defer_write))
     adapter.enable_icecache(model, dtype=torch.float16, device=device, infer_state=state)
 
     if args.inject_pages != "off":
@@ -265,6 +273,7 @@ def run_backend(args, backend, samples, tokenizer, device, max_new_tokens, outpu
             "sample_id": sample["id"], "dataset": None if sample["id"] == "prompt" else args.dataset,
             "model": args.model, "seed": args.seed + (sample["id"] if isinstance(sample["id"], int) else 0),
             "threads": args.threads, "page_size": args.page_size, "page_budget": args.page_budget,
+            "page_scan_defer_write": args.page_scan_defer_write,
             "page_topk": args.page_topk, "backend": backend, "actual_backend": actual,
             "inject_pages": args.inject_pages,
             "pag_ef_search": args.pag_ef_search,

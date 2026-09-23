@@ -92,6 +92,13 @@ class InferState:
         # overlap: 5.2x on 8 threads against 2.77 GB/s serial. <=1 keeps the
         # serial loop, for A/B and as an escape hatch.
         page_scan_write_threads=8,
+        # Defer the *join* of those writes out of the flush and onto each
+        # layer's first reader (InferState.recall), so the CPU page write
+        # overlaps the first decode step instead of blocking the TTFT tail.
+        # A scheduling change only: the bytes written, and the order they are
+        # read in, are identical either way. Off by default, and inert (a
+        # no-op) on the page_scan_write_threads <= 1 serial branch.
+        page_scan_defer_write=False,
         **kwargs,
     ) -> None:
         self.n_layers = n_layers
@@ -127,6 +134,13 @@ class InferState:
         # Lazily built: most runs never offload anything, and a pool per
         # InferState is cheap but not free.
         self._page_scan_write_pool = None
+        # Outstanding deferred page writes, {(batch, layer): [Future, ...]}.
+        # `None` when
+        # page_scan_defer_write is off, which makes every join a one-attribute
+        # no-op; when on it is the only thing that keeps a write's K/V views --
+        # and the stash they point into -- alive past _page_scan_flush.
+        self.page_scan_defer_write = bool(page_scan_defer_write)
+        self._page_scan_write_futures = {} if self.page_scan_defer_write else None
         self.pag_config = (pag_generation_reserve, pag_max_search_k,
                            pag_ef_search, pag_topm_initial_factor,
                            pag_ef_construction, pag_target_degree, pag_projection_levels)
@@ -386,6 +400,13 @@ class InferState:
             pool.shutdown(wait=True)
 
     def _prepare_prefill(self, bsz, q_len):
+        # A deferred page write that outlived the previous row's decode must
+        # land before anything below reuses what it reads: `page_scans` is reset
+        # to [None] * n_layers, the CPU caches are rebuilt, and the stash is
+        # handed out again at the first _page_scan_stash_put. Joining here (and
+        # re-raising there) is what makes the deferral safe across rows --
+        # hazard 2, and the exception channel of hazard 3.
+        self._page_scan_join_all_writes()
         self.num_offload_pages = None
         self.n_dci_pages = None
         self.offload_win_flag = [False] * self.n_layers
@@ -685,18 +706,31 @@ class InferState:
     # Everything below is gated on retrieval_backend == "page_scan"; the DCI path
     # above is untouched and stays runnable as the baseline arm.
 
-    def _page_scan_write(self, b, cur_id, pages, slots, key_states, value_states):
+    def _page_scan_write(self, b, cur_id, pages, slots, key_states, value_states,
+                         cpu_cache=None, base=None, head0=0):
         """Write one layer's own K/V into its CPU pages at ``(page, slot)``.
 
-        ``pages``/``slots`` are ``int32 [H, m]``; the payloads are ``float32
-        [H, m, head_dim]``. The CPU pages were allocated contiguously and never
+        ``pages``/``slots`` are ``int32 [h, m]``; the payloads are ``float32
+        [h, m, head_dim]``. The CPU pages were allocated contiguously and never
         move (spec section 7, hazard 1), so page ``p``'s K plane for head ``h``
         lives at ``region[p, 0, h]`` of the frame allocated at prefill.
+
+        ``h`` is the whole head count on every synchronous caller (prefill
+        batch, decode insert) and the caller passes no target: the cache, its
+        base address and the head ids are then resolved from ``self`` exactly as
+        before. A *deferred* write passes them in, because the worker outlives
+        the flush and ``_prepare_prefill`` rebinds ``self.cpu_kv_caches`` and
+        ``self.page_scans`` -- resolving either inside the worker would let it
+        write into the next row's cache, or read ``None`` (hazard 1). ``head0``
+        is the first head id of a head-sliced call (the flush submits one head
+        per task); ``pages.shape[0]`` is then 1 rather than ``n_kv_heads``.
         """
-        cpu_cache = self.cpu_kv_caches[cur_id]
-        base = int(cpu_cache.c2p[b, 0])
+        if cpu_cache is None:
+            cpu_cache = self.cpu_kv_caches[cur_id]
+        if base is None:
+            base = int(cpu_cache.c2p[b, 0])
         region = cpu_cache.pool.buffer.numpy()[base:]
-        heads = np.arange(self.n_kv_heads)[:, None]
+        heads = np.arange(head0, head0 + pages.shape[0])[:, None]
         region[pages, 0, heads, slots] = np.asarray(key_states)
         region[pages, 1, heads, slots] = np.asarray(value_states)
 
@@ -953,6 +987,16 @@ class InferState:
         # copy, so they run on a small pool. Serial this loop sustains only
         # 2.77 GB/s (it is a scattered 4-D fancy-index store, not a memcpy) and
         # cost 1070 ms/row of TTFT; 8 threads measured 5.2x on the same work.
+        if self.page_scan_defer_write and self.page_scan_write_threads > 1:
+            # Same pool and the same writes as the branch below, but the join
+            # moves to each layer's first reader (`recall`): the write is the
+            # last phase of this tail and nothing in the first decode step
+            # reads a page before then, so it can run under the decode instead
+            # of in front of it. The serial branch below is a no-op for the
+            # flag, and this branch does its own stash release at the last
+            # join -- see _page_scan_join_write.
+            self._page_scan_submit_deferred_writes(pending)
+            return
         if self.page_scan_write_threads > 1 and len(pending) > 1:
             if self._page_scan_write_pool is None:
                 self._page_scan_write_pool = ThreadPoolExecutor(
@@ -965,6 +1009,128 @@ class InferState:
         # Every entry has been consumed, so the stash can be handed out again.
         # The entries above hold views into it, and `pending` is the only thing
         # that keeps them alive past this point; it dies with the frame.
+        self._page_scan_stash_used = 0
+
+    def _page_scan_submit_deferred_writes(self, pending):
+        """Submit the flush's CPU page writes and keep their futures.
+
+        The deferred variant of :meth:`_page_scan_flush`'s pool branch. The
+        writes are the same and go to the same pool; only the join moves, to
+        each layer's first reader (:meth:`recall`, via
+        :meth:`_page_scan_join_write`).
+
+        Two things are resolved *here* rather than in the worker, because the
+        worker now outlives the flush and ``_prepare_prefill`` rebinds both
+        (hazard 1): the partition (``self.page_scans`` becomes ``[None] *
+        n_layers``, so a late worker would read ``None`` or the next row's
+        scan) and the destination cache plus its base address
+        (``self.cpu_kv_caches`` is rebuilt wholesale). ``token2page`` and
+        ``offset_in_page`` are immutable after the build -- ``PageScan.insert``
+        mutates only ``reps``, ``page_sizes``, ``_free`` and ``_n_built`` -- so
+        holding the arrays is safe; the pool buffer behind ``base`` never moves
+        within a prompt either, which is what makes ``page p``'s address valid.
+
+        Tasks are one head each, in layer order. The pool's queue is FIFO, so a
+        per-layer task would make layer 0's write wait a whole layer's worth of
+        store behind it; at head granularity layer 0 is the first wave. Layer 0
+        is also the first reader in the decode step, so this is the one
+        granularity choice that matters. The K/V slices are views onto the
+        stash (they keep it alive, as ``pending`` used to), so this costs no
+        copies.
+        """
+        pool = self._page_scan_write_pool
+        if pool is None:
+            # max_workers from the configured thread count, not from
+            # len(pending): this pool is cached across prompts, and the first
+            # flush of a run may be the one with the fewest entries.
+            pool = ThreadPoolExecutor(
+                max_workers=max(1, self.page_scan_write_threads))
+            self._page_scan_write_pool = pool
+        futures = self._page_scan_write_futures
+        H = self.n_kv_heads
+        for entry in pending:
+            b, cur_id, k, v, reuse_id = entry
+            scan = self.page_scans[cur_id if reuse_id == 0 else reuse_id]
+            if scan is None or scan.token2page is None:
+                # Unreachable: _page_scan_flush only runs writes after every
+                # builder adopted its partition. A loud stop, not a guess.
+                raise RuntimeError(
+                    f"page_scan layer {cur_id} has no partition to write")
+            pages = scan.token2page
+            slots = scan.offset_in_page
+            cpu_cache = self.cpu_kv_caches[cur_id]
+            base = int(cpu_cache.c2p[b, 0])
+            group = []
+            for h in range(H):
+                group.append(pool.submit(
+                    self._page_scan_write, b, cur_id, pages[h:h + 1],
+                    slots[h:h + 1], k[h:h + 1], v[h:h + 1],
+                    cpu_cache, base, h))
+            # Keyed by (b, layer), not layer: `_DCI_first_call` loops
+            # `for b in range(bsz)` and stashes one entry per *sequence*, so a
+            # layer id alone would silently overwrite the previous element's
+            # futures and lose their exception channel.
+            futures[(b, cur_id)] = group
+
+    def _page_scan_join_write(self, b, cur_id):
+        """Join sequence ``b``'s deferred CPU page writes for ``cur_id``.
+
+        Called from :meth:`recall`, which is where a layer's CPU pages are
+        actually read (``_page_scan_add``'s decode-time writes go to *other*
+        (page, slot) pairs, so they neither need nor wait on this). Correct by
+        construction: the read cannot happen before the write returns, so the
+        worst case is a stall, never an unwritten page.
+
+        A worker exception is re-raised here, on the reader's thread, after the
+        whole layer's group has been joined. Without this the ``list(map(...))``
+        that used to force the exception would be gone and the failure would
+        surface as silently wrong attention values instead of a crash.
+        """
+        futures = self._page_scan_write_futures
+        if futures is None:
+            return
+        key = (b, cur_id)
+        group = futures.get(key)
+        if group is None:
+            return
+        failed = None
+        for fut in group:
+            try:
+                fut.result()
+            except BaseException as exc:  # re-raised below, after the joins
+                if failed is None:
+                    failed = exc
+        del futures[key]
+        if failed is not None:
+            raise failed
+        if not futures:
+            # Every write that reads the stash has completed, so it may be
+            # handed out again (hazard 2). The entries are the only thing that
+            # keeps it -- and the K/V views the writes point into -- alive past
+            # the flush, and until now that reference died with the frame.
+            self._page_scan_stash_used = 0
+
+    def _page_scan_join_all_writes(self):
+        """Join every outstanding deferred page write, re-raising the first failure.
+
+        The batch-owning counterpart of :meth:`_page_scan_join_write`: a layer
+        whose CPU pages are never read (so never joined at :meth:`recall`) still
+        has to be joined before the next prompt reuses its partition, its CPU
+        cache and the stash -- ``_prepare_prefill`` resets all three.
+        """
+        futures = self._page_scan_write_futures
+        if not futures:
+            return
+        failed = None
+        for cur_id in list(futures):
+            for fut in futures.pop(cur_id):
+                try:
+                    fut.result()
+                except BaseException as exc:  # re-raised below, after the joins
+                    if failed is None:
+                        failed = exc
+        if failed is not None:
+            raise failed
         self._page_scan_stash_used = 0
 
     def _page_scan_write_entry(self, entry):
@@ -1477,6 +1643,12 @@ class InferState:
         measured 369 us -> 31 us per call at H=8, since the loop's cost was
         numpy fancy-indexing overhead, not the 80 elements it copies.
         """
+        if self.page_scan_defer_write:
+            # This is the first reader of the layer's CPU pages, so it owns the
+            # join of the write that filled them (page_scan_defer_write off
+            # means _page_scan_flush already joined it).
+            self._page_scan_join_write(b, layer_idx)
+
         thread_id = threading.get_ident()
         if hasattr(self, '_thread_locals') and thread_id in self._thread_locals:
             thread_local = self._thread_locals[thread_id]
