@@ -7,11 +7,13 @@
     "chatglm2-6b-32k": "THUDM/chatglm2-6b-32k",
     "chatglm3-6b-32k": "THUDM/chatglm3-6b-32k",
     "vicuna-v1.5-7b-16k": "lmsys/vicuna-7b-v1.5-16k",
-    "mistral-7b-inst": "mistralai/Mistral-7B-Instruct-v0.2",
+    "mistral-7b-inst": "/opt/model/Mistral-7B-Instruct-v0.2",
     "llama-3-8b-inst-64k": "MaziyarPanahi/Llama-3-8B-Instruct-64k",
     "llama-3-8b-inst-1048k": "gradientai/Llama-3-8B-Instruct-Gradient-1048k",
     "llama-3.1": "meta-llama/Llama-3.1-8B-Instruct",
     "qwen3": "Qwen/Qwen3-4B",
     "qwen3-4b": "Qwen/Qwen3-4B",
-    "qwen3-32b": "Qwen/Qwen3-32B"
+    "qwen3-32b": "Qwen/Qwen3-32B",
+    "qwen2.5-7b-inst": "/opt/model/Qwen/Qwen2.5-7B-Instruct",
+    "qwen3-4b-2507": "/opt/model/Qwen/Qwen3-4B-Instruct-2507"
 }

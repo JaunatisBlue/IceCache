@@ -282,6 +282,10 @@ def get_pred(
                 {
                     "length": json_obj["length"],
                     "token_length": context_length,
+                    # generated token count, available from the same `output`
+                    # that produced `pred` (both branches end in `)[0]`);
+                    # arm-dependent, must be reported alongside accuracy.
+                    "generated_tokens": int(len(output) - context_length),
                     "pred": pred,
                     "answers": json_obj["answers"],
                     "all_classes": json_obj["all_classes"],

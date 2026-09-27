@@ -29,6 +29,30 @@ class DeprecatedError(NotImplementedError):
 
 Digest = Tuple[Tensor, Tensor]
 
+# Fraction of the free device memory one greedy group may claim in
+# _page_scan_flush. The group's footprint is ~3x its keys tensor (see
+# _PAGE_SCAN_GREEDY_PEAK_FACTOR), so the budget has to leave room for the device
+# page pool -- which at long prompts holds ~n_builders * ceil(N / 16) pages and is
+# never reclaimed -- and for the model. A quarter of what the driver reports free
+# is small enough to leave both headroom, and large enough that short prompts
+# stay one group: the whole 12-layer builder batch at a 16k prompt is ~790 MB of
+# keys, 2.4 GB at the 3x peak, against ~19.8 GiB of budget for a quarter of an
+# empty 80 GB card.
+_PAGE_SCAN_GROUP_FREE_FRACTION = 0.25
+
+# The greedy's peak is three full-size [M, N, D] tensors at the production
+# shape, not one -- measured, not assumed. A gc storage dump taken at the 150k
+# OOM (one row, 34 builder layers, M = 34 * 8 = 272, N = 149824) lists, on top of
+# a 22.000 GiB device page pool, a 19.432 GiB `keys`, a 19.150 GiB `live_k`
+# (the span gather) and then one further 18.87 GiB request, which is the
+# contiguous operand `torch.bmm` materialises out of `live_k.transpose(1, 2)`
+# (`_greedy_packed_pages_live` documents the same behaviour on the numerics
+# side: a materialised transposed operand is what moves 2015 of a row's entries).
+# 57.45 GiB for M=272 at N=149824, against a 19.43 GiB keys tensor. Budgeting the
+# groups at the keys tensor alone would over-size them ~3x on exactly the
+# prompts this grouping exists for.
+_PAGE_SCAN_GREEDY_PEAK_FACTOR = 3
+
 
 class InferState:
     def __init__(
@@ -55,6 +79,15 @@ class InferState:
         group_size=None,
         n_groups=None,
         debug=False,
+        # The factor by which the adapter repeats each KV head before the
+        # tensors reach the kernels, so that `n_kv_heads` above is the
+        # *presented* count: `kv_head_rep == n_kv_heads //
+        # config.num_key_value_heads`. It is 1 -- no repetition, no change to
+        # any shape -- for every model whose GQA group size the kernels
+        # support ({1, 4, 8}), and equals the native group size otherwise
+        # (7 for Qwen2.5-7B), where the duplicated heads make the group size
+        # the kernels see equal to 1. See adapter/modeling.py:_repeat_kv_heads.
+        kv_head_rep=1,
         ratio_1=0.01,
         ratio_2=0.2,
         retrieval_backend="dci",
@@ -104,6 +137,7 @@ class InferState:
         self.n_layers = n_layers
         self.n_qo_heads = n_qo_heads
         self.n_kv_heads = n_kv_heads
+        self.kv_head_rep = int(kv_head_rep)
         self.ratio = self.n_qo_heads // self.n_kv_heads
         assert self.ratio >= 1
         self.head_dim = head_dim
@@ -916,6 +950,59 @@ class InferState:
             self._page_scan_keys_dev = buf
         return buf
 
+    def _page_scan_group_layers(self, n_builders, H, N, D, itemsize):
+        """Builder layers one greedy group may hold at the current free memory.
+
+        The group is sized by its *peak* footprint, which is
+        ``_PAGE_SCAN_GREEDY_PEAK_FACTOR`` times its ``[G * H, N, D]`` keys --
+        keys, the ``live_k`` span gather, and the contiguous operand ``bmm``
+        materialises out of the transposed ``live_k``. That factor is measured,
+        not assumed: at M=272, N=149824 those three are 19.432, 19.150 and
+        18.87 GiB (see the constant). Budgeting the keys tensor alone would
+        over-size the group threefold on exactly the long prompts this exists
+        for.
+
+        What it has to fit beside: the device page pool, which by flush time
+        holds ``n_builders * ceil(N / page_size)`` pages and is never reclaimed,
+        the model, and the live activations. Against 79.25 GiB usable, 3x the
+        300k keys tensor (116.7 GiB) is more than the card before anything else
+        is counted, so no single group can be the whole batch there; a handful
+        of layers can.
+
+        The budget is a fraction of what ``mem_get_info`` reports *free* at this
+        moment, which is the number that already excludes the pool's live pages,
+        the allocator's cache and everything else resident. It is read per flush,
+        not cached, because the pool's occupancy is exactly what changed between
+        prompts. The quarter leaves the 3x footprint's own slack (the ``[M, N]``
+        masks and the bounded norms chunk) inside the remaining three quarters.
+
+        Floored at one layer. A single layer is the smallest unit
+        ``greedy_packed_pages`` can be handed here -- there is no finer grouping
+        -- so a budget too small for one layer is exceeded rather than served by
+        something smaller. Refusing to serve is the alternative, and a build
+        that fits is worth more than a promise that does not.
+
+        Returning ``n_builders`` means one group: the whole batch, then exactly
+        today's work. That is the case for every short prompt.
+        """
+        if self.device.type != "cuda":
+            # No card to query. `device` is the model's device, so this is the
+            # CPU-model case; the flush still works there (`greedy_packed_pages`
+            # dispatches to the CPU loop for a CPU tensor) and there is no device
+            # page pool to share with. One group, as before.
+            return int(n_builders)
+        peak_bytes = _PAGE_SCAN_GREEDY_PEAK_FACTOR * H * N * D * itemsize
+        # `self.device` may be the *un-indexed* `torch.device("cuda")` (that is
+        # what the harness builds when it launches with CUDA_VISIBLE_DEVICES),
+        # and `mem_get_info` rejects that: "Expected a torch.device with a
+        # specified index or an integer". Tensors built on an un-indexed device
+        # land on the current one, so that is the device to query; an explicit
+        # index is passed through untouched.
+        free, _ = torch.cuda.mem_get_info(
+            self.device if self.device.index is not None else torch.cuda.current_device())
+        budget = int(_PAGE_SCAN_GROUP_FREE_FRACTION * free)
+        return max(1, min(int(n_builders), max(1, budget // max(1, peak_bytes))))
+
     def _page_scan_flush(self):
         """Run every deferred greedy as ONE batch, then write each layer's pages.
 
@@ -937,6 +1024,34 @@ class InferState:
         Batching is bit-exact against per-layer builds: every op in the loop is
         row-independent, and measured on real keys packing 16 heads at once vs
         8+8 gave 0/188320 differing entries.
+
+        **Memory-adaptive grouping (the 150k-300k prompt fix).** The batch is not
+        one greedy any more: the builder layers are split into consecutive groups
+        and each group gets its own ``greedy_packed_pages`` + ``build_from_packed``
+        pass. The group size is computed at runtime from the free device memory
+        (:meth:`_page_scan_group_layers`), so a prompt whose whole batch fits is
+        still exactly one group and does exactly the work it did before -- no new
+        kernel, no extra DMA, no extra pass. It is sized by the group's *peak*
+        footprint, three full-size tensors rather than one, which is what the
+        150k measurement says a greedy of this shape actually occupies.
+
+        Splitting cannot change the partition. ``greedy_packed_pages`` is
+        row-independent -- ``argmax``, ``masked_fill``, ``topk`` and the two
+        scatters are per row, and the row bmm is a batched matmul whose batch
+        index only selects an operand -- so packing ``M`` heads across groups is
+        the same per-head computation as packing them together. That is the same
+        property the batching above already rests on, at the 16-vs-8+8
+        granularity it was measured at (0/188320); grouping moves the group
+        boundary, not the argument. It is stated here rather than re-measured
+        because a smaller group can only be *more* like a single-layer build.
+        ``build_from_packed`` is per layer -- its ``H`` is one layer's KV heads --
+        so which group a layer lands in is not observable to it either.
+
+        The group's tensors are dropped before the next group allocates, and
+        nothing downstream reorders: ``packed`` per group dies with the group,
+        and the write phase below still runs only after every group has finished,
+        which is what the reuse layers need (they write at their *source's*
+        partition, so no write may start before every partition exists).
         """
         pending = self._page_scan_deferred
         if not pending:
@@ -945,39 +1060,53 @@ class InferState:
         H = self.n_kv_heads
         builders = [i for i, p in enumerate(pending) if p[4] == 0]
         if builders:
-            # One greedy for every builder layer. use_sim=False because the
+            # Greedy per group of builder layers. use_sim=False because the
             # materialised [M, N, N] similarity would be 99 GB at 96 heads; the
             # row-on-demand path is still 4.27x ahead of building them serially.
             #
-            # One greedy packs them all at a shared token count, so unequal
-            # lengths would silently mis-slice the result. Every layer offloads
-            # the same prompt under the same budget, so this holds -- but assert
-            # it rather than trust it, since the failure is a wrong partition,
-            # not a crash.
+            # One greedy packs its whole group at a shared token count, so
+            # unequal lengths would silently mis-slice the result. Every layer
+            # offloads the same prompt under the same budget, so this holds --
+            # but assert it rather than trust it, since the failure is a wrong
+            # partition, not a crash.
             lengths = {int(pending[i][2].shape[1]) for i in builders}
             if len(lengths) != 1:
                 raise RuntimeError(
                     f"page_scan batch needs one token count across layers, got {sorted(lengths)}")
-            # One DMA per builder layer straight out of the stash, into a device
-            # buffer that outlives the flush. The greedy and every
-            # build_from_packed below run on this stream, so the copies are
-            # ordered ahead of their first reader without an explicit sync.
             sample = pending[builders[0]][2]
-            keys = self._page_scan_keys_device(
-                len(builders) * H, int(sample.shape[1]), int(sample.shape[2]),
-                sample.dtype)
-            for slot, i in enumerate(builders):
-                keys[slot * H:(slot + 1) * H].copy_(pending[i][2], non_blocking=True)
-            packed = greedy_packed_pages(keys, self.page_size, use_sim=False)
-            for n, i in enumerate(builders):
-                cur_id = pending[i][1]
-                scan = self.page_scans[cur_id]
-                # The GPU slice goes back in so the keys are not sent over PCIe
-                # a second time; the CPU copy stays for the write below.
-                scan.build_from_packed(
-                    packed[n * H:(n + 1) * H], keys[n * H:(n + 1) * H],
-                    n_reserved=scan.n_pages)
-            del packed
+            N, D = int(sample.shape[1]), int(sample.shape[2])
+            group_layers = self._page_scan_group_layers(
+                len(builders), H, N, D, sample.element_size())
+            for start in range(0, len(builders), group_layers):
+                group = builders[start:start + group_layers]
+                # One DMA per layer of the group straight out of the stash, into
+                # a device buffer that outlives the group. The greedy and every
+                # build_from_packed below run on this stream, so the copies are
+                # ordered ahead of their first reader without an explicit sync --
+                # including the next group's copies over a reused buffer, which
+                # land after the kernels that read it.
+                keys = self._page_scan_keys_device(
+                    len(group) * H, N, D, sample.dtype)
+                for slot, i in enumerate(group):
+                    keys[slot * H:(slot + 1) * H].copy_(pending[i][2], non_blocking=True)
+                packed = greedy_packed_pages(keys, self.page_size, use_sim=False)
+                for n, i in enumerate(group):
+                    cur_id = pending[i][1]
+                    scan = self.page_scans[cur_id]
+                    # The GPU slice goes back in so the keys are not sent over
+                    # PCIe a second time; the CPU copy stays for the write below.
+                    scan.build_from_packed(
+                        packed[n * H:(n + 1) * H], keys[n * H:(n + 1) * H],
+                        n_reserved=scan.n_pages)
+                # Drop the group before the next one allocates, so the flush
+                # holds one group's keys and partition, not all of them. `keys`
+                # is the buffer `_page_scan_keys_device` caches, so a repeated
+                # group shape reuses it as-is (the next group's copy_ lands after
+                # the kernels that read it, same stream) and only a shorter last
+                # group reallocates it. The old buffer survives in the cache
+                # until that rebind, so a shape change briefly holds two -- one
+                # group's worth each, never the whole batch.
+                del keys, packed
         # Writes run after every partition exists, so the reuse layers -- which
         # write their own K/V at their source's (page, slot) -- read a partition
         # that is already complete.
@@ -1551,6 +1680,40 @@ class InferState:
         padded_arrays = torch.tensor(nn_idx_0, **self._ci32)
         head_ids = torch.arange(
             self.n_kv_heads, device=padded_arrays.device).unsqueeze(1)
+
+        # `num_neighbours` above is `n_dci_pages - layer2topk[cur_id]`, and
+        # `n_dci_pages` is NOT constant across a row. During decode,
+        # `kv_cache.py:196-199` shrinks `kvc.n_win_pages` by `offload_ratio - 1`
+        # each eviction cycle -- deliberately, the window narrows and hands more
+        # pages to the retrieval set -- and `n_dci_pages` is derived from it
+        # (`_prepare_decode`, and `kv_cache.py:n_dci = budget - ns - n_win`).
+        # So the selection WIDTH grows mid-row.
+        #
+        # `selected_page_idx[cur_id]` is the previous token's selection, cached
+        # per layer for the whole row, and `diff_pages_by_head` requires it to
+        # have the current width: it asserts
+        # `A.shape == B.shape == mask.shape`, where A is the fresh `nn_idx_0` and
+        # the mask is indexed BY it, so those two always agree and a width change
+        # can only ever show up as B. Measured 2026-09-26: `nn_idx_0=(8, 5)` vs
+        # `cached_prev=(8, 4)` on llama-3.1 multi_news row 117.
+        #
+        # A diff against a selection of a different width is meaningless -- there
+        # is no correspondence between the old slots and the new -- so re-seed
+        # exactly as the row's first call does, which defines "the previous
+        # selection" as the pages currently resident at the new width.
+        #
+        # WHY IT LOOKS LIKE A NARROW BAND, and does not reproduce on most rows:
+        # prefill sets `n_dci_pages = min(2*(n_real_pages - budget), budget - ns - nw)`,
+        # so it only reaches the stable cap (budget - ns - nw = 12 here) once
+        # `n_real_pages >= 22`. Below that the window still has room to shrink, so
+        # the width moves and this path is taken. At page_size 16 / budget 16 that
+        # is prompts in (256, 336] tokens; >= 337 is stable and never trips it.
+        # (`n_final_win_pages` is captured in `KvCache.__init__` BEFORE
+        # `kv_cache.py:110` overwrites `n_win_pages`, so it is the constructor's
+        # `n_win_pages`, i.e. 2 -- which is why the shrink stops there.)
+        if (self.selected_page_idx[cur_id] is not None
+                and self.selected_page_idx[cur_id].shape != nn_idx_0.shape):
+            self.selected_page_idx[cur_id] = None
 
         if self.selected_page_idx[cur_id] is None:
             # evicted_idx, recall_idx, evict_num

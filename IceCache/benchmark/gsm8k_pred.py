@@ -8,6 +8,7 @@ import time
 import torch
 import numpy as np
 import datasets
+import jinja2
 import transformers
 from pathlib import Path
 import torch.distributed as dist
@@ -48,9 +49,13 @@ def parse_args(cmd_args=None):
             "llama-3-8b-inst-1048k",
             "llama-3.1",
             "qwen32",
-            "qwen3-4b"
+            "qwen3-4b",
+            "qwen2.5-7b-inst",
+            "qwen3-4b-2507"
         ],
     )
+    ap.add_argument("--model_path", type=str, default=None,
+                    help="Override longbench_config/model2path.json")
     ap.add_argument("--name", type=str, default="default")
     ap.add_argument("--prompt_file", type=str, default="gsm8k_prompt_formal.txt", help="")
     ap.add_argument("--icecache", action="store_true", help="Enable IceCache")
@@ -59,6 +64,19 @@ def parse_args(cmd_args=None):
     ap.add_argument("--max_length", type=int, default=None, help="")
     ap.add_argument("--max_new_tokens", type=int, default=256, help="")
     ap.add_argument("--exp_name", type=str, default="dafault_exp")
+    ap.add_argument(
+        "--start_idx",
+        type=int,
+        default=0,
+        help="First dataset row to process; earlier rows are skipped entirely "
+        "(only affects which rows are processed, for resuming a run).",
+    )
+    ap.add_argument(
+        "--end_idx",
+        type=int,
+        default=-1,
+        help="Dataset row to stop before (exclusive); -1 means to the end of the dataset.",
+    )
     ap.add_argument("--n-unlimited-layers", type=int, default=2)
     ap.add_argument("--n-max-bytes", type=int, default=40 * (1 << 28))
     ap.add_argument("--n-max-cpu-bytes", type=int, default=80 * (1 << 28))
@@ -77,6 +95,13 @@ def parse_args(cmd_args=None):
     ap.add_argument("--pag-ef-construction", type=int, default=200)
     ap.add_argument("--pag-target-degree", type=int, default=16)
     ap.add_argument("--pag-projection-levels", type=int, default=64)
+    ap.add_argument(
+        "--chat_template",
+        action="store_true",
+        help="Wrap each prompt in the model's own chat template before "
+        "tokenizing (required for instruct checkpoints). Off by default, "
+        "which reproduces the plain-text prompt exactly.",
+    )
     ap.add_argument("--do_sample", action="store_true", default=False, help="")
     ap.add_argument("--temperature", type=float, default=0.0, help="")
     ap.add_argument("--top_k", type=int, default=50, help="")
@@ -114,6 +139,38 @@ def parse_args(cmd_args=None):
     if args.page_budgets < 0:
         args.page_budgets = None
     return args
+
+
+def build_chat(tokenizer, prompt, model_name):
+    """Wrap a raw prompt in the model's own chat template.
+
+    Mirrors the builder in longbench_pred.py, but prefers the tokenizer's jinja
+    template for every model family and only falls back to a hardcoded [INST]
+    wrapper when the tokenizer cannot apply one (older tokenizers, or a
+    checkpoint whose tokenizer_config declares no chat_template).
+    """
+    messages = [{"role": "user", "content": prompt}]
+    if "qwen" in model_name.lower():
+        # Qwen3 "Instruct-2507" checkpoints have no thinking mode and their
+        # template may reject or ignore enable_thinking, so retry without it.
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except (TypeError, ValueError, AttributeError, jinja2.TemplateError):
+            pass
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except (TypeError, ValueError, AttributeError, jinja2.TemplateError):
+        # No chat template at all: fall back to the Mistral-style wrapper.
+        return f"[INST]{prompt}[/INST]"
 
 
 def load_model_and_tokenizer(path, model_name, device, args):
@@ -280,7 +337,7 @@ if __name__ == "__main__":
     # define your model
     max_length = model2maxlen[model_name]
     model, tokenizer = load_model_and_tokenizer(
-        model2path[model_name], model_name, device, args
+        args.model_path or model2path[model_name], model_name, device, args
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -325,15 +382,50 @@ if __name__ == "__main__":
     all_samples = []
     all_question, all_generation, all_answer = [], [], []
 
+    # Resume: seed the accumulators from a previous (possibly crashed) run, so
+    # the accuracy is computed over the union of previous and current rows.
+    if evaluation_result_file.exists():
+        try:
+            with evaluation_result_file.open("r") as handle:
+                previous_result = json.load(handle)
+            previous_samples = previous_result["samples"]
+        except (json.JSONDecodeError, KeyError, ValueError) as error:
+            logging.warning(f"Ignoring unreadable {evaluation_result_file}: {error}")
+            previous_samples = []
+        for previous in previous_samples:
+            sample = EvaluationSample(**previous)
+            all_samples.append(sample)
+            all_question.append(sample.question)
+            all_generation.append(sample.generation)
+            all_answer.append(sample.answer)
+            acc_list.append(sample.is_pred_true)
+    # The question field is unique in this dataset, so it identifies a done row.
+    seen_questions = {sample.question for sample in all_samples}
+    logging.info(f"Resuming from {len(all_samples)} previously completed rows.")
+
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluate GSM8K"):
+        for idx, batch in enumerate(tqdm(dataloader, desc="Evaluate GSM8K")):
+            if idx < args.start_idx:
+                continue
+            if args.end_idx >= 0 and idx >= args.end_idx:
+                break
             questions = batch["question"]
             answers = batch["answer"]
           
+            # A row written by the previous run is not counted twice.
+            if all(question in seen_questions for question in questions):
+                continue
+
             prompts = [
                 prompt_cot + "\nQuestion: " + question + "\n"
                 for question in questions
             ]
+
+            if args.chat_template:
+                prompts = [
+                    build_chat(tokenizer, prompt, model_name)
+                    for prompt in prompts
+                ]
 
             inputs = tokenizer(
                 prompts,
@@ -409,7 +501,19 @@ if __name__ == "__main__":
                 all_samples.append(sample)
 
             acc_list.append(sample.is_pred_true)
+            seen_questions.add(sample.question)
             print('acc: {:.5f}'.format(np.mean(acc_list)))
+
+            # Checkpoint after every row: a crash loses at most this row.
+            accuracy = sum([sample.is_pred_true for sample in all_samples]) / len(all_samples)
+            evaluation_result = EvaluationResults(
+                samples=all_samples, metrics=EvaluationMetrics(accuracy=accuracy)
+            )
+            with evaluation_result_file.open("w") as handle:
+                json.dump(evaluation_result.to_dict(), handle)
+            with generation_file.open("w") as handle:
+                for question, generation, answer in zip(all_question, all_generation, all_answer):
+                    handle.write("Q: %s\nA_model:\n%s\nA:\n%s\n\n" % (question, generation, answer))
 
         accuracy = sum([sample.is_pred_true for sample in all_samples]) / len(all_samples)
         evaluation_metric = EvaluationMetrics(accuracy=accuracy)

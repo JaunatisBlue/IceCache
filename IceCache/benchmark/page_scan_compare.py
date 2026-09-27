@@ -11,6 +11,7 @@ uses the same model, prompts, generation settings, and per-sample seed.
 import argparse
 import json
 import random
+import resource
 import sys
 import time
 from pathlib import Path
@@ -214,11 +215,30 @@ def run_backend(args, backend, samples, tokenizer, device, max_new_tokens, outpu
     model = AutoModelForCausalLM.from_pretrained(
         args.model, local_files_only=True, torch_dtype=torch.float16).to(device).eval()
     config = model.config
-    if config.model_type != "qwen3":
-        raise ValueError("This comparison currently supports Qwen3 checkpoints only")
-    # The current IceCache adapter detects Qwen3 normalization from this name.
-    # A local checkpoint directory may not contain "qwen3" in its path.
-    if "qwen3" not in config._name_or_path.lower():
+    # The IceCache adapter picks its q/k-norm path off `config._name_or_path`:
+    # adapter/modeling.py:105/240/343 test for the substring "qwen3" and apply
+    # q_norm/k_norm, and every other checkpoint takes the `else` (reshape, no
+    # norm). So this guard's job is to keep an architecture off a norm path that
+    # was never measured for it. It stays an ALLOWLIST on purpose: an unknown
+    # model_type fails loudly rather than taking an unmeasured branch.
+    #
+    # NOTE ON WHY llama IS SAFE TO ADMIT, because the obvious story is wrong:
+    # modeling.py:154/:365 test for "llama", but they are DEAD for llama-3.1 --
+    # their condition is `pretraining_tp > 1` and this checkpoint has 1. Llama
+    # 3.1's correctness comes from its path NOT containing "qwen3", which routes
+    # it to the generic `else`. That is also a fail-loud path, not a silent one:
+    # if a llama checkpoint ever did take the qwen3 branch, `self.q_norm` does not
+    # exist in `model.safetensors.index.json` and it would raise AttributeError,
+    # not silently mis-normalise.
+    if config.model_type not in ("qwen3", "llama"):
+        raise ValueError(
+            "This comparison supports qwen3 and llama checkpoints only; got "
+            f"{config.model_type!r}")
+    # Only a qwen3 checkpoint gets its name rewritten: a local directory may not
+    # contain the string "qwen3", and the adapter reads that string to choose the
+    # norm. Rewriting it for anything else would route that model onto the qwen3
+    # norm, so this must stay gated on model_type rather than on the path alone.
+    if config.model_type == "qwen3" and "qwen3" not in config._name_or_path.lower():
         config._name_or_path = "qwen3"
     if args.n_unlimited_layers >= config.num_hidden_layers:
         raise ValueError("n-unlimited-layers must leave at least one retrieval layer")
@@ -284,10 +304,13 @@ def run_backend(args, backend, samples, tokenizer, device, max_new_tokens, outpu
             "score": score_prediction(prediction, sample, args.dataset),
             "prompt_tokens": prompt_tokens, "generated_tokens": len(generated) - prompt_tokens,
             "ttft_s": timer.times[0] - start if timer.times else None,
+            "tt2t_s": timer.times[1] - start if len(timer.times) > 1 else None,
             "tpot_s": (timer.times[-1] - timer.times[0]) / (len(timer.times) - 1)
             if len(timer.times) > 1 else None,
             "total_s": end - start,
             "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+            "host_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+            "argv": sys.argv,
         }
         with output.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")

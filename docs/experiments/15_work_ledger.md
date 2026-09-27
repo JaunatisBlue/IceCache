@@ -113,6 +113,21 @@ base1 0.8314 → opt 0.7709 → base2 0.8469 ms，168/200，p=9e-24；同代码�
 - **CUDA scatter 未定义行为**：`out[rows[sel], rank[sel]] = flat[sel]` 里重复候选与下一个首次出现共享输出槽，
   CUDA 上是未定义的——实测发出重复页号并丢掉一个不同页号（需要 12 个唯一 id 只给出 11 个），准确率腰斩到 0.1482。
   合成随机键几乎从不碰撞，真实键经常碰撞，所以单元测试通过了。
+- **`scatter_pages(None, None)` 崩溃（2026-09-26，未提交）**：`estimate_select_recall` 在
+  `use_dci` 为假时按设计返回 `(None, None)`（`infer_state.py:1712/1717`），而 `modeling.py`
+  的两个调用点只判 `kvc.n_pages > budget`，把 None 直接送进要求四个张量的 pybind11 绑定 →
+  `TypeError: scatter_pages(): incompatible function arguments`。触发条件是
+  **prompt ≤ budget×page_size = 16×16 = 256**：`prefill_evict_extra_pages` 走
+  `else: self.use_dci = False`（`:1960`，「无事可卸载」），随后 decode 越过 256 就崩。
+  确定性，不是竞态——它杀掉了 llama-3.1 的 `multi_news` 第 96 行（日志 `Context length: 222`）。
+  **这两处都是上游代码**（`git blame` → `63db4c11`，Yuzhen Mao，2026-04-04），HEAD 本身在这些输入上也会崩。
+  修法：`if eids is not None: … else: assert not state.use_dci`——保留旧的响度，不静默跳过。
+  **代价（必须写进表注）**：这些行的**整个 decode 都在 `use_dci = False` 下**，
+  于是不建 page_scan 结构、不召回、不 scatter，`decode_sdpa` 传 `page_valid_entries=None`，
+  decode 退化为固定 `c2p` 集上的普通分页注意力。**这些行两个 arm 都没算过**，
+  在任何一个差异都藏在 `use_dci` 后面的 arm 下结果完全相同——是空测量，不是结果。
+  判据是精确的：`token_length <= 256` 且 `token_length + generated_tokens > 256`。
+  注意 `token_length` 逐元素等于日志里的 `Context length:`（95/95 行实测一致）。
 
 ### 9. page_scan 尾巴的 stash 复用 + H2D 直推 — `d86be89`（合并 `67428de`，报告 `17_`）
 
@@ -148,6 +163,47 @@ glibc 给每个 32 MB 块 mmap，那次释放是 **68 次 munmap，实测占 159
 而是**去 nonzero（1.31 ms/token）**；隔离探针合计只解释 ~60% 的 live 效应。
 
 ---
+
+### 11. 上游竞态：prefill 的页表被 worker 线程截断（2026-09-26 发现，**未修，论文必须披露**）
+
+`_page_scan_layout`（`infer_state.py:737-779`，截断在 `:758-759`）把 `kvc.c2p` 从 `[1,R]`
+换成 `[1, budget] = [1,16]`（sink+window）。它跑在**卸载 worker 线程**上
+（`modeling.py:145` 提交 `prefill_evict_extra_pages_wrapper` → `_page_scan_first_call` →
+`_page_scan_layout`），而**主线程**在几条语句之后（`modeling.py:150`）的 `prefill_sdpa` 里
+读同一个属性，把它交给 prefill kernel——但那个 kernel 的 plan 是按 **R 页**建的
+（`infer_state.py:541` `n_kv_pages = ceil(q_len/page_size)`，`:547-549`
+`kv_indptrs_tab = arange(0, bsz*R+1, R)`）。`batch_prefill.cu:79-115` 只查 dim/dtype，
+**没有** `CHECK_EQ(paged_kv_indices.numel(), paged_kv_indptr[-1])`，就把裸指针交给 kernel（`:129`）。
+
+worker 赢下竞态时，kernel 被告知「R 页」却拿到 16 元素的表，于是读
+`paged_kv_indices[16 … R-1]` **越界**（最多 44 字节），每个垃圾 int32 又被当成
+pool 页偏移解引用 → `CUDA error: an illegal memory access`。异步，所以在下一个阻塞调用处
+才 surface（实测：下一行 prefill 的 `c2p` H2D，`kv_cache.py:230`）。
+
+**可达性只需要 `R > budget`，即 `L > 256`**——本矩阵 3550 行里只有 2 行不满足，
+所以几乎每一行都处在这个竞态下，只是主线程通常赢（`:140-142` 主线程只 join **上一层**的
+worker 任务，本层的提交与读取之间没有同步）。`_page_scan_layout` 的 docstring
+（`:784-793`）写着「`prefill_sdpa` 紧跟这次调用读 `kvc.c2p`」——作者知道顺序要紧，
+但**没有任何东西强制它**。`_page_scan_defer_write` 默认关闭，与本竞态无关。
+
+**这是上游的、与后端无关的**：DCI 路径在同一 worker 线程上有同样的截断（`:1246-1255`）。
+
+**大多数赢是良性的**：被释放的块通常还留着旧 `c2p` 的尾部，越界读拿回的恰好是**正确**的页号；
+只有当 worker 自己的 `PageScan` 分配复用了那个块时才致命。这与 ~3550 行里 1 次致命吻合。
+
+**实测（2026-09-26，llama-3.1 `multi_news`）**：
+- seed 117 → 第 119 行崩，两次，确定性；seed 118 / seed 119（进程里无带内行）→ 5 行全过。
+- 同一序列加 `CUDA_LAUNCH_BLOCKING=1` **不崩** → **是竞态，不是确定性越界**。
+- tokenizer 普查全部 16 个子任务 3550 行：带内行（`L∈[257,432]`，宽度会中途变化）只有 2 行，
+  都在 multi_news（117 @ 314、199 @ 345）；已完成 1510 行的实测 `token_length` 与普查逐行吻合。
+- 注意：**「带内行是必要条件」是概率陈述，不是确定性**。带内行改变的是时序，不是可达性。
+
+**为什么本轮不改**：候选修法（把 join 加回 `prefill_sdpa` 之前，或把截断提前到 plan 建立之前）
+都会动到 **prefill 的关键路径／TTFT**，而 TTFT 正是本文的结论轴；改了就得重测全部延迟数据。
+本轮只采集准确率，所以**不动代码**，把这条作为已知的上游鲁棒性问题披露。
+想确认它是否真的发生过（而不只是没崩），最便宜的探针是在 `prefill_sdpa` 调用点加
+`assert kvc.c2p.shape[-1] == <plan 的页数>`——断言触发即证明竞态被赢下。**留待矩阵结束后的
+独立进程里做**，且只能作为诊断，不能当成修法。
 
 ## 第二部分 · 失败的探索（**不要重试，除非有新证据**）
 
@@ -189,11 +245,13 @@ glibc 给每个 32 MB 块 mmap，那次释放是 **68 次 munmap，实测占 159
 | **CPU 页写 scatter 移植到 C++**（`scatter_pages_cpu`） | **不合并：live 是 null** | 代码正确、能走 `setup.py` 构建、24/24 行 prediction+score 逐字相同、11/11 对抗几何 0 差异、带内 verify 门也通过。**但 live A/B 里处理效应比它自己的空跑还小且变号**（A 块 −11.7 ms / B 块 +15.1 ms，同代码空跑 −18.9 / +7.9）。见下。 |
 
 **★ 上一条的机制值得单独记：这个页写是 TLB 受限的，所以「索引更便宜」买不到东西。**
+**〔2026-09-23 更正：「TLB 受限」已被直接证伪，见本节末尾的修正块。下面的推理保留原样，但不要再引用。〕**
 
 隔离单调用确实快：numpy 284 ms → C `memcpy` 232 ms（**1.22x**）；对照能到 115 ms（2.47x，不可达）。
 但**在真实并发下**（34 层做页写、8 线程、live 几何）numpy 455 vs C 441 = **1.03x**；
 在现实的**连续**页范围上甚至是 **0.97x**（更慢）。
 原因：THP 关闭时每个 512 B 存储落在不同 4K 页上，**两者都是 TLB 受限**，更便宜的索引迭代器省不出东西。
+**〔更正：这个前提 2026-09-23 被证伪——给目的地 512 倍的 TLB 覆盖反而更慢，所以理由不成立。〕**
 线程扫描 4/8/16/32 对两者都没帮助（numpy 364/297/308/321，C 311/291/309/320）——**8 线程本来就是对的**。
 其它形状更差：目的序 gather 251 ms，整页顺序写 296 ms（**更慢**），NT stores 1597 ms（灾难）。
 
@@ -203,6 +261,32 @@ glibc 给每个 32 MB 块 mmap，那次释放是 **68 次 munmap，实测占 159
 **顺带修正 brief 里的两个数字**：`~296 ms` 是**第 7 行**的数；第 12 行是 ~300 ms 墙钟、
 承载 **~2052 ms 聚合 CPU / 8 线程**。而且是 **34 层**在做页写，不是 12 层。
 brief 还漏了两项：`f06_del` ~317 ms、H2D ~268 ms（greedy ~629 ms）。
+
+**★ 2026-09-23 修正：上面「TLB 受限」的机制被直接证伪；中途一版「测不出效果」的结论本身是 NUMA 假象。**
+
+把 pinned pool（`/dev/zero` shmem）用 `shmem_enabled=force` 强制成 2 MiB 大页，处理**确实生效**
+（`pmd_lower_bound_frac_of_tensor` = 1.00，对照臂全为 0.0；`THPeligible`=1，`ShmemPmdMapped`=33,554,432 kB），然后测：
+
+- **反面结论：给目的地 512 倍的 TLB 覆盖，页写反而慢 ~11%**（335.5–344.0 → 377.4–381.5 ms，中位数，两组不重叠）。
+  所以这个页写**不是**目的地 TLB 受限的——上面那条理由作废。
+- **一版「no detectable effect」的结论是 NUMA 假象，不是噪声。** 这台是双路 Xeon 5218，进程级 pinned 分配会随机落在
+  本地/远端节点。直接证据：`contiguous_1t` 同代码跨进程在**不绑核**时散成 515–976 ms，
+  `numactl --cpunodebind=N --membind=N` 之后复现到 <2%（node0 845.6–859.4，node1 843.4–857.4）。
+  8 线程 scatter 本身的 node0/node1 差就有 **25%**（427–433 vs 340–343 ms）。
+  **本节所有决定性数字都来自绑 node1 的那一遍**；生产的未绑进程看到的是更宽、不受控的分布。
+- **源侧 THP 反而略快**（placebo 臂 `enabled=always`，stash 的 AnonHugePages 99.96%）：326.7/329.3 ms vs 335.5–344.0，
+  即「目的地 4 KB + 源 2 MB」快 ~8–17 ms；而「目的地 2 MB + 源 4 KB」慢 ~35–45 ms。两端都是真处理，方向相反。
+  **~10 ms 级别，低于噪声底，不值得收。**
+- **单进程切换旋钮的死法值得记**：旋钮**生效**（`THPeligible`=1，可双向切换），但**大页不出现**——
+  进程内已持有几十 GB 之后，新映射只拿到 0.07% / 29% 的巨大页，fresh 进程是 96–99%。
+
+**同时作废的还有「~296 ms 不可压缩」这个印象。** 页写**不是带宽受限**：scatter 8t 只有 **13.2 GB/s**、
+contiguous 8t **19.7 GB/s**，而本机 DRAM 约 250 GB/s（2×6-ch DDR4-2666）。所以 C 移植那个 null
+也**不能**再用 TLB 解释（它的 live A/B 本身是 null，结论留着，解释换掉）。
+局部性红利是 **~110 ms**（335.5 → 225.3），不是 ~300 ms；8 线程连续写的可达上界是 ~225 ms。
+
+另：那台 bench 之前把 34 层写进**同一套 998 页**（真实布局是每层 `1032 + 1262*li` 起的独立块，各碰前 998 页），
+工作集只有 1/34，也把旧测量**偏向 null**。
 
 ### 2.4 方向性否决（诚实记录，未启动）
 
@@ -373,6 +457,42 @@ brief 还漏了两项：`f06_del` ~317 ms、H2D ~268 ms（greedy ~629 ms）。
     → **写预算表时，先写下每一项用的缩放律，并检查全表是否同律**；
     **区分「部件耗时」和「该改动能从它身上省下的量」**，后者往往只有前者的一半。
 
+22. **★ 用「幸存的那些行」去反推阈值——那是幸存者偏差，不是测量。**
+    定位 `scatter_pages` 崩溃时我写：「幸存的 95 行里最小的上下文是 505，**都在阈值以上**，
+    条件就是这样钉下来的」。**这是错的**：那 95 行是数据集顺序的**前缀**，
+    它们全部 > 256 只说明前缀里没有短行，**完全不能把阈值钉在 256**——
+    (222, 505] 区间里任何值都符合同样的证据。256 是**从代码里读出来的**
+    （`n_real_pages = ceil(prompt/page_size) <= budget`），日志只是佐证（一行 222，它崩了）。
+    → **阈值、边界、计数这类结论，来源必须是代码或覆盖两个方向的实验**；
+    **对「幸存的 N 个都满足 X」这句话，先问一句：这 N 个是不是按某种顺序取的前缀？**
+    这条已经写进了 `modeling.py` 的注释里，独立复核把它抓了出来。
+
+23. **★ 探针的分母是「被测区间」还是「探针自己的区间」——选错一次，`Others` 就从 32% 变成 46%。**
+    给 page_scan 做 (c) 图的时间分解时，探针同时报了两个分母：**host 的 token 间隔**
+    （按构造 `mean(interval) == tpot_s`，探针行读到 **113.59 ms**）和
+    **设备侧的 `d:attn_frame`**（同一个 63-token 窗口，**90.24 ms/token**）。
+    同一个配置的干净 TPOT 是 **89.53 ms**——frame 复现到 0.8%，而探针自己的 host 间隔
+    **高了 26%**。也就是说**探针的开销落在 frame 之外、host 区间之内**；
+    若用 host 区间当分母，这 26% 会整块落进 `Others`，让它从 **31.9% 虚报成 45.9%**，
+    而多出来的部分**是测量装置，不是方法**。
+    → **分解的分母必须是「被分解的那个量」**：图 (b) 画的是干净 TPOT，
+    图 (c) 就得配一个能复现该 TPOT 的区间，并写清四个段**不加总到探针行的 `tpot_s`**。
+    → 连带结论：**探针会扰动它自己报告的那个数**（这里 +26%），
+    所以探针行上的 `tpot_s`／`ttft_s` **不能当作干净读数引用**。
+
+    **补充（2026-09-26，同一件事的第二半，是更该记的那半）**：上面这条当时的结论是
+    「那就用设备 frame `d:attn_frame` 当分母」——**这个结论本身也是错的**，而且错在
+    最讨好的方向（它让 `Others` 从 46% 降到 32%，好看）。声称「frame 复现干净 TPOT 到 0.8%，
+    所以探针开销都在 frame 之外」是**从一个巧合推因果**。后来让探针**直接测自己每次包装调用的
+    host 成本**（两个 `perf_counter` 括住包装体本身），实测 **20.8 ms/token**，
+    其中 **15.1 ms 就在 frame 之内**（=frame 自身的 +16.6%）。原来那句「376 条 event 每条约 1 us」
+    **差了约 55 倍**（一次包装调用 ≈55 us，不是 1 us）。
+    → **凡是「我的仪器开销可以忽略」这类断言，要么测出来，要么不要写。** 这条在本仓库
+    已经是第三次（见第 16 条 `synchronize`、[[instrumentation-that-changes-what-it-measures]]）。
+    → 而且**两轮独立核对的分工值得记**：第一轮找出的四条全是真的、但全是外围
+    （provenance / shebang / docstring 措辞）；**改变数字的那条是第二轮、靠对着脚本自己的输出读出来的**，
+    不是靠再跑一次。一轮核对不等于核对。
+
 ---
 
 ## 第四部分 · 现在的 §12.2 位置
@@ -449,6 +569,13 @@ page_scan 端到端要追回 **0.2723 s**（报告 `19_` §1，`16_` 时代是 0
 而是「两条轴都赢，而且端到端更快」。这比再挤 TPOT 有价值得多：
 TPOT 已经领先 1.29x（0.7772），而 `total_s` 现在还是负的。
 
+> **⚠ 2026-09-23 末更正（报告 `21_`）：上面这段的两个数都过期了。** `total_s` 差额
+> **0.2723 来自 `16_` 窗口**，`19_` 窗口是 1.0540；推迟页写（`57c0049`，ON 臂）把它压到
+> **1.0233**，即差额 **0.089 s**，不是 0.2723。**「17% 尾巴」那个除数因此也变了**，
+> 而且 `total_s` 已经被这个改动推动了很大一块——**再次引用前先在同一个窗口里补跑 DCI。**
+> 更要紧的是：推迟页写**降低了 TTFT 却抬高了 TPOT**（0.7772 → 1.3803），
+> **所以「两条轴都赢」并没有实现，反而把 TPOT 轴让出去了。**
+
 ### 尾巴的现状（2026-09-23 复核，报告 `17_`）
 
 **先纠正一个曾把这条线判死的前提：尾巴没有衰减。** 此前认为「尾巴上省的毫秒只有约 35%
@@ -463,7 +590,7 @@ TPOT 已经领先 1.29x（0.7772），而 `total_s` 现在还是负的。
 | 项 | 量级 | 状态 |
 |---|---|---|
 | greedy | **~629–638 ms** | 最大项，**算法角度已收口（2026-09-23）**：两条独立论证都说 638 ms 里没有大的算法空间了，见下面「贪心线为什么关了」。只剩两个各约 10% 的实现向杠杆 |
-| **CPU 页写 scatter** | **~300 ms** | **已否决**：C++ 移植 live 是 null（TLB 受限，隔离 1.22x → live 1.00x）。见 2.3 |
+| **CPU 页写 scatter** | **~300 ms** | **C++ 移植已否决**（live 是 null，见 2.3）。**但「把它的 join 推迟到各层首个读者」已实现并实测通过**（`57c0049`，flag `--page-scan-defer-write`，**默认 OFF**）：**TTFT −334 ms、decode +217 ms 一次性、`total_s` −117 ms（36/40 行）**，8 臂逐字段相同，准确率 0.404190 全同。**这是把工作搬进 decode，不是省掉它**；见 `21_` |
 | `f06_del`（释放 4.45 GB clone） | ~317 ms | **已在主线上消除**（`67428de` 的 stash 复用就是冲它去的） |
 | H2D | ~268 ms | pinned 变体已实测否决（见 `17_` §2） |
 
@@ -473,6 +600,21 @@ TPOT 已经领先 1.29x（0.7772），而 `total_s` 现在还是负的。
 
 **已完成的 `d86be89`（stash 复用 + H2D 直推）：TTFT −200…−390 ms、160/160 逐字段相同，
 代价是常驻内存 +4.15 GiB（峰值反而 −500 MB）。合并前必须声明这项内存代价。**
+
+**★ 尾巴线的收口（2026-09-23 末，报告 `21_` + 独立复算 `VERIFY_21_`）。** 尾巴的每一项现在
+都有判决：greedy ~638 ms（算法角度收口）、页写 ~300 ms（C++ 移植 null，但**推迟 join 的
+变体实测有效**）、`f06_del` ~317 ms（已消除）、H2D ~268 ms（否决）。**推迟页写是这条线上
+最大的、经独立复算仍成立的 TTFT 动作**，但它**不是净胜**：把 217 ms 一次性搬进 decode。
+**它的 TPOT 代价是常数、不是每 token 速率**（G=32 行实测 +0.228 s，而 40.6 ms/token 的
+速率模型会预测 +1.258 s），所以 1.3803 那个 TPOT 比值里约 240 ms 是「除以 (G−1)」的
+短答案归一化；按 token 加权的读数是 **1.1400**。
+
+**⚠ 上面「下一步唯一清晰的杠杆」里那句「现在需要追回的只有 0.2723 s」用的是 `16_` 窗口的基线**
+（该处已就地更正）。`19_` 窗口是 `total_s` 1.0540；本 A/B 的 OFF 臂 1.0540、ON 臂 1.0233。
+**不要跨窗口引用这几个数。**
+**并且：本 A/B 的 OFF 臂与 `19_` 的 page_scan 臂是同一条代码路径，两者差 61 ms（1.7%）——
+这 61 ms 是 `21_` §6 里「ON 臂超过 DCI」那个 87 ms 边际的 70%。任何跨窗口的 DCI 比值
+都需要在同一个窗口内补跑 DCI 臂，否则不要写。**
 
 ### 贪心线为什么关了（2026-09-23，两个 agent 反向作业后收口）
 
@@ -566,6 +708,44 @@ fp16 上过 17/17 只证明了一个贪心见不到的 dtype。
 | §12.2 第一次直接测（**已被 `19_` 取代**，只留方法） | `docs/experiments/16_merged_head_to_head.md`（测的是 `5eaa622`） |
 | **page_scan 的 TTFT 尾巴：stash 复用 + H2D 直推** | **`docs/experiments/17_page_scan_tail.md`**（改动 `d86be89`，**已合并** `67428de`） |
 | **decode 查询路径：别名化 + 去 nonzero** | **`docs/experiments/18_page_scan_decode_query.md`**（改动 `6a229dc`，**已合并** `257e0d8`） |
+| **★ 推迟页写的判决（尾巴线的收口）** | **`docs/experiments/21_deferred_page_write_verdict.md`** + 独立复算 `VERIFY_21_deferred_write.md`（改动 `57c0049`，flag `--page-scan-defer-write` **默认 OFF**）。**自身的 −334 ms TTFT 成立；「因此超过 DCI」不成立** |
+| **★ 论文实验计划（表 1 / 表 2 / 图 7 的落地）** | **`docs/experiments/22_paper_experiment_plan.md`**。含：能跑/不能跑的边界（本地**没有任何** SOTA 基线实现）、模型清单、预算 256/128/64 的映射、harness 使能清单、成本外推（**全量 LongBench 4,750 行 ≈ 45 GPU h**）与执行顺序 |
+| **★ stage-1 门的结果** | **`docs/experiments/23_stage1_gate_result.md`**（`57c0049`，8 臂 × 40 行，位置配平串行）。**主判据通过：pooled TPOT 0.7719**（`19_` 目标 0.7772，CI [0.758,0.797]），ps 侧 `gen_tok` 6.350 与 `score` 0.404190 **与 `19_` 逐位相同**。**预注册的效应判据按字面失败（2.69× < 4×）**——原因是判据拿池化效应比单臂零底，结构不匹配；同构池化零底为 4.14%，比值 5.51×。另：两条入口点路径 **39/40 预测逐字相同** |
+| **★ row 25 那 1/40 的查清结果** | **`docs/experiments/24_row25_mismatch_resolution.md`**（两个独立调查者，都用真 tokenizer 实跑）。**不是入口点差异**：两条入口点 prompt 管线**逐位相同**（row 25 两边都 9955 token）。真因是**参照产物过期**——`pred/qwen3-4b/page_scan_r3/hotpotqa.jsonl` 的 mtime 是 **2026-09-21 09:18:41**，与同代 harness 运行 200/200 相同。当前版本各运行互一致，与旧产物恰在 `{25,57,81,97,99,122,187,189}` 8 行不同，**落在 0..39 的只有 25**。**对准确率不可见**（两版 row 25 都得 0 分）。**后果：E-C′ 的参照系必须换成同版本同窗口** |
+| **E-A 预算-256 正式矩阵已起跑（2026-09-25 15:25）** | Qwen3-4B × 21 任务 × **全量 4,750 行** × 4 臂（`full`/`dci`/`ps`/`ps_reuse3`），预算 256 = 文件默认（`--page-size 16 --page-budgets 16`）。**双 GPU 并行**（用户 2026-09-25 新规：准确率可用双 GPU；延迟仍须 GPU0 独占且 GPU1 空闲）。GPU0=`full`+`dci`，GPU1=`ps`+`ps_reuse3`，各约 32 h。**跨 GPU 同一性预检 20/20 通过**。驱动 `/home/yx/.claude/jobs/2fb2a453/tmp/matrix/run_matrix256.sh`，产物 `pred/qwen3-4b/mx256_<arm>/`，逐数据集可续跑 |
+| **两处必须在开跑前修的错** | ① `longbench_pred.py` 的 `length` 是**数据集自带列**、`token_length` 是 **prompt** 数，**生成长度根本没记录**——计划 §4 原写「已在记录里」是错的，已补 `generated_tokens`（+4/−0，独立验证）。② §6.1 的 45 h 用的是 hotpotqa 单任务速率（每 query 只生成 ~6 token），**漏掉生成时间**；冒烟实测重标为 **串行 ~63.7 h**，双 GPU ~32 h |
+| **本机代理陷阱** | 环境里 `http_proxy`/`https_proxy` 默认指向 `127.0.0.1:14568`；用户明确要求**下模型不走代理**。已实测 `hf-mirror.com` / `modelscope.cn` **免代理直连可用**（~1.4 s）。下模型前必须 `unset` 这两个变量 |
+| **★ 准确率矩阵缩臂：只跑自己的方法（用户 2026-09-25 21:15）** | 用户决定 E-A 只留 **`ps` / `ps_reuse3`** 两个臂，`full` 与 `dci` 不跑。`full` 在 14/21 数据集 / **2685 行**处停止，**数据保留**（驱动逐数据集续跑，随时可续）。`ps` 在 GPU1 继续（15:28 起），`ps_reuse3` 改派 GPU0 并行（21:14 起）。**代价已记录**：准确率表失去全部对照行，计划 §0「不劣于/优于 M-DCI」不再有数据支撑；**对 DCI 的胜负主张只剩 E-C 延迟图**（不受影响） |
+| **★ 参考论文的数字不能直接拼进我们的表** | 用户主张「参考的数据直接用，准确率和硬件没关系」。**硬件那半对**（同模型同方法，准确率与硬件无关）；**但错配的是模型**：参考论文表 1 用 **Llama-3.1-8B-Instruct + Mistral-7B-Instruct-v0.2**，我们跑 **Qwen3-4B**。跨模型并排会让读者把模型差读成方法差。**已从 PDF 原文核实**（非记忆），并做了第二次对抗性复核 → `25_reference_paper_verified_facts.md` |
+| **★ 并表问题的最终决定（用户 2026-09-25）** | 核实结果摆出后，用户改选：**「只报 Qwen3-4B，他们的数只做引用」**——我们的表只列自己的实测，参考论文数字在正文/脚注引用并注明模型不同、不可直接比。**代价**：放弃「同模型可比表」这条路；**收益**：零误导风险、零额外 GPU 时间。**连带**：为并表下的 Mistral-7B / LongChat-7B **不再必需**（已下的保留），**Qwen3-32B（65 G）不下载**。写进计划 §1.1 |
+| **★ E-C 延迟驱动已建成（等 GPU）** | `/home/yx/.claude/jobs/2fb2a453/tmp/ec/run_ec.sh` + `analyze_ec.py`。**36k prompt 已固化**：`prompts36k/prompt_00..15.txt`，**各恰 36000 token**（模板后计），种子 `20260925` —— 必须固化，因为 `passkey_pred.py:55` 的生成器**无种子**，逐臂现生成会让臂间比的不是同一输入。生成器 `make_prompts.py` **纯 CPU**，GPU 忙时可跑。改动前先读驱动头部注释里的四条约束 |
+| **★ E-C 驱动里的 `eval "flock LOCK cd X && python"` 是双重失效——已修** | 复核抓到、我独立复现。**bash 把 `&&` 先绑定**，`flock` 的 argv 只剩 `cd`：① **cd 在子进程里执行，改不了父进程 cwd**，python 是相对文件名 → 从 `$BM` 以外任何地方启动都立刻 `can't open file`；② **flock 立刻释放**，python 全程在锁外 → 头部写的「串行、GPU0 独占」**根本没执行**。讽刺的是矩阵驱动用的是**正确**写法（`flock … bash -c "cd … && python …"`），是我照抄错了。改为数组 + `( cd "$BM"; flock "$LOCK" env … "${pre_arr[@]}" "${py[@]}" )`，**彻底去掉 `eval`**。实测：从 `/tmp` 启动能进 `benchmark/`、环境变量传下去、锁在跑动期间被持有。**教训：`eval` 拼接命令字符串会把 shell 的算子优先级偷换掉；用数组，别用字符串** |
+| **★ 同轮复核修掉的另三处** | ① `analyze_ec.py` 的 `None - None`：`tt2t_s` 在生成不足 1 token 时合法为 None，未过滤会 `TypeError`，而且是在**跑完昂贵的那一步之后**才崩——整个图白跑。② `page_scan_compare.py:320-321` 对已存在的 `--output` 抛 `FileExistsError`，重跑时每次都失败，而分析器仍 glob 那些陈旧文件当当前结果——**正是它自己警告的「混窗口」**。已在跑前 `rm -f`。③ 守卫里 `2>/dev/null` + `[ "$busy1" -ne 0 ]`：nvidia-smi 失败时 `busy1` 为空，测试**求值为假 → 静默放行到忙卡上**。改成 `case "" \| *[!0-9]*)` **fail-closed** |
+| **★ 36k 那档要用 `--prompt-file`，且模型参数不能用注册表别名** | `page_scan_compare.py:36` 的 `--prompt-file` 使 `load_samples:98-100` 只返回一条样本，**模型加载在计时之外**（`:262-270` 只夹 `model.generate`），所以一进程一 prompt 是干净的。**两个踩过的坑**：① `--model` 在这里是 HF id/本地路径（`:215` 直接 `from_pretrained`），**`qwen3-4b` 是 `longbench_pred.py` 的注册表别名，会失败**——门用的是 `Qwen/Qwen3-4B`；② 生成时 `--out` 用了相对路径，`prompts.json` 里存成相对路径，而命令先 `cd $BM`，会去找不存在的 `benchmark/prompts36k/`——**已改为绝对路径并在驱动里断言** |
+| **★ 模型下载完成，但用途已被取消 → 不再必需** | Mistral-7B-Instruct-v0.2（**15.7 G**）与 LongChat-7B-v1.5-32k（**13.5 G**）已下到 `/opt/model`，manifest 在 `/opt/model/DOWNLOAD_MANIFEST.txt`（171 行，覆盖 `/opt/model` 全部模型，含 id/来源/sha/大小/日期/sha256，并**醒目声明这两个是为已取消的并表所需、不是必需产物、可删以回收约 29 G**）。`/dev/sdc` 剩余 **375 GB**。**代理确认绕开**（读运行中进程的 `/proc/<pid>/environ`：无任何 proxy 变量，有 `HF_ENDPOINT=hf-mirror.com`）。**Qwen3-32B 未下载**（用户决定不并表） |
+| **★ 下载陷阱：hf-mirror 会把大文件 302 重定向到 Xet 源站** | `hf-mirror.com/.../resolve/main/model-*.safetensors` 返回 **302 → `cas-bridge.xethub.hf.co`**。**镜像只代理小文件；约 28 GB 权重字节全部来自 Xet 源站**，而该地址在本网络反复断连（28 次 `Read timed out`、4 次 `SSL: UNEXPECTED_EOF_WHILE_READING`），速度在 0–3.5 MB/s 波动，只能靠断点续传累积（Mistral 第 1 次跑 2 h 后失败，续传第 2 次成功）。**`HF_HUB_DISABLE_XET=1` 解决不了**——变量名确认无误（`constants.py:294`）也确实生效，但**镜像侧自己重定向，客户端挡不住** |
+| **★ `/opt/model/Qwen/` 下有只差连字符码位的同名目录** | `Qwen2.5-7B-Instruct`（**ASCII `0x2d`**）= **15 G 真 checkpoint**；`Qwen2.5‑7B‑Instruct`（**U+2011 `0x2011`**）= **12 M 近空残件**。用 `/opt/model/Qwen/Qwen2.5*7B*` 之类 glob **会撞进残件**。**一次核查 agent 据此报「Qwen2.5 是残缺副本」——那是把残件当成了本体，计划 §2.3 的 15 G 那条没错**（已亲自核过） |
+| **★ 延迟协议的前提被推翻：`numactl` 绑定会撞上线程数混杂** | 计划 §6.1 原写「正式矩阵必须 `numactl` 绑定」。**拓扑实测后不能照字面执行**：`nvidia-smi topo -m` → **GPU0 在 NUMA node 0（CPU 0-15,32-47，仅 32 个逻辑 CPU）**，GPU1 在 node 1（16-31,48-63）。全机 2×16 核/64 线程，**每 node 只有 32 个逻辑 CPU**。而延迟口径是 **`--threads 64`**。绑到 node0 就只剩 32 个逻辑 CPU，`--threads 64` 变 2× 超订；为迁就绑定降到 `--threads 32` 则**正踩 `benchmark-thread-confound`**（`--threads` 压制 DCI 不压制 numpy，当年造假过一次 page_scan 加速）。→ **stage-3 对照（任务 #27）必须把「线程数」当一维**，候选：①不绑/64（基线）②绑 node0/32（**只用于显示混杂，不可采用**）③只绑内存 node0/64 ④绑两 node/内存 node0/64 |
+| **★ E-C 的 36k 够得到，不用改代码** | `page_scan_compare.py` **已有 `--prompt-file`**（`:36`），`load_samples` 当一行样本处理，`answers=None` 故不打分（`:134`）——正是延迟图要的。`prepare_input` 对 `--prompt` **跳过 chat template**（`:125`），所以**文本要自带模板**。长度：harness 默认 `--max-input-tokens 32760`（超过中间截断），但 **Qwen3-4B 自身 `max_position_embeddings` = 40960**（无 rope_scaling），**抬参数即可**。⚠ 但 `model2maxlen.json` 里 `qwen3-4b` = 32760 是**产线截断上限**，**36k 略在产线包络之外，必须在文里声明**。⚠ `passkey_pred.py:43` 的生成器**无种子**（`:55`），**必须固定一个 prompt 文件逐臂复用**，否则臂间比的不是同一输入 |
+| **★★ E-C 的 TPOT 分子分母都是我控不住的——复核①抓到，已用门（不是注释）修掉** | **`tpot_s` 是派生的，不是量出来的**：`page_scan_compare.py:289-290` 是 `(times[-1]-times[0])/(len(times)-1)`，`TokenTimer` 是 StoppingCriteria 每步触发一次，所以**分母 = `generated_tokens - 1`，逐臂、逐 prompt 不同**；而 `--max-new-tokens` 是**上限不是长度**，贪心遇 EOS 即停。**在门自己的数据上量过**（`tmp/gate/ps1.jsonl`）：**ps1 分母 min=1、median=4.0、max=31，17/40 行分母 ≤3**。**我最初造的 prompt 恰是短答案型**（`"What is the pass key? The pass key is"`，1-2 token 就答完）——那样量到的是**头一步解码开销**，不是稳态 decode，且两臂平均的步数还不一样。复核①给的暴露量：**同一批测量在 n=1 时比值 0.995、n=6 时 0.842、n=63 时 0.793**，即**只是解码长度就能把头条比值搬动约 25%**。而我在驱动里写的注释「`NEWTOK=64` 固定解码长度」**是错的**——它固定的是上限。**修法（不改 harness，`generated_tokens`/`prompt_tokens` 在 `:294` 已有）**：① `make_prompts.py` 把任务换成**要求长回答**（"写一份详尽分析，不要早停"），正文改为种子词表的**多变文本**而非同一句重复；② `analyze_ec.py` 新增**硬门**——任一行的 `generated_tokens != 64` 或 `prompt_tokens != 36000` 就**拒绝出比值**（不是打印警告）；③ `run_ec.sh` 每次运行后**立即校验该行**并中止整个 phase（失败要尽早，不是等 32 次跑完）。**门两个方向都实测**：健康夹具出比值（0.7500，16/16），把一行改成 `generated_tokens=5` 后**拒绝并点名该行**。**另修一处 fail-open**：早期写成「命中 `*BAD:*` 才中止」，于是 `ROWS=0`（跑完却没落记录）会被当成功放行，**已改成必须命中 `OK`**。**教训：派生量的分母要当成被测对象来控，不能当成常量** |
+| **★★ 最终范围（用户 2026-09-25 22:2x）——「不是这个的统统取消」** | 用户原话：「就做一个任务，用 page scan 跑 Single-Document QA / Multi-Document QA / Summarization / Few-shot Learning / Synthetic / Code 这 16 个子任务，budget 取 256，model 用 Qwen3-4B 和 Llama-3.1-8B-Instruct。然后再用 page scan 跑 latency。你排查一下，后续的规划有没有不是这个的，不是的统统取消」。**我逐条排查了计划并全部标注：**<br>**已取消**：① 参考论文表 1 未收录的 5 个子任务（`multifieldqa_zh`/`dureader`/`vcsum`/`lsht`/`passage_retrieval_zh`）——正在跑的矩阵在跑 21 个，其中 5 个作废；② 预算 128/64；③ **`ps_reuse3` 臂**；④ E-B（Qwen3-8B/Qwen2.5-7B）；⑤ E-D 扫描；⑥ E-C′ 合并趟；⑦ E-E 系统消融 11 项；⑧ 「延迟准确率之外」的**可复现性**测试。<br>**保留**：主表（page_scan × 16 子任务 × 256 × 2 模型）、E-C 延迟（**用户明确保留 DCI 对照**）、第三个测试改为**峰值内存**（用户三选一选定）。<br>**执行**：22:26 kill 掉在跑 21 子任务的 `ps` 与 `ps_reuse3` 两臂（**数据 1950 + 771 行全部保留在盘上**），改用新驱动 `run_final.sh` 只跑 16 个；Qwen3-4B 续跑（自动跳过已完成的 8 个），Llama-3.1-8B 在 GPU0 首跑 |
+| **★ Llama-3.1-8B-Instruct 能跑，不用改 harness——但 `--model` 必须用注册表键** | 三处 `if "qwen3" in config._name_or_path.lower()`（`adapter/modeling.py:105/240/294`）都是 **Qwen3 独有的 `q_norm`/`k_norm`**；Llama-3.1 没有这两层，走 `else` 分支正是对的。**踩到的坑**：`build_chat`（`longbench_pred.py:111`）用 `"llama" in model_name` **区分大小写**，而本地路径 `/opt/model/LLM-Research/Meta-**L**lama-3.1-8B-Instruct` 里是大写 L，**直接传路径会落到错误的模板分支**。正确写法是 `--model llama-3.1 --model-path /opt/model/...`（`:349` 有 `args.model_path or model2path[model_name]` 的覆盖口）。实测 16 行正常产出 |
+| **★★ 对照论文表 1/表 2：预算单位**不可比**，我们不许声称「同预算」** | 第三轮取证（300 dpi 渲染 + 31 行算术复核）。论文**从未定义 budget 单位**且前后不一致：p.1 说 *"256-token budget"*，p.8 说 *"cache budget = {256,128,64}"*；Algorithm 1 把 *"Page size s"* 当输入但**全文没给 s 的值**；**没说 256 是每头/每层/总量**。我们的 256 = 16 页 × 16 token **每层每头**。**两边口径无法判定是否相同 → 正文只能并列陈述并声明未对齐，禁止写成「同预算下比较」**。另：`Avg.` 经 31 行算术复核确认为**16 子任务等权平均**（平均偏差 0.116 vs 族均值 0.648），但**论文自己的 Avg 列有 7/31 行不自洽**，别去逐位对齐；表 2 **没有百分比列**（97.2% 等在正文） |
+| **★★ 我写的截断判据是错的，复核实测 85 行变 0 行** | 计划 §6.1 原写「截断会让 prompt 长度**恰好等于 32760**，用 `prompt_tokens` 直接查」。**错**：`longbench_pred.py` 先在 `:196-200` 截**模板前**的 prompt，`:209` 才 `build_chat`，`:226` 才记 `context_length`——所以被截断的行记的是 **32760 + 模板长度**。**实测 `mx256_ps/narrativeqa.jsonl`：85/200 行恰好 32772，`== 32760` 判据得 0 行**。已改为 `>= 32760` 并**声明它是上界**（模板约 +12 token，未截断但原始长度落在 32749–32759 的行也会命中；只有跳过 `build_chat` 的 6 个任务才是恰 32760）。**教训与上一行同源：字段是「套模板之后」量的，任何「恰等于某常量」的判据先确认量的时机** |
+| **★ E-A 表分析器建成并冻结（跑数之前）** | `/home/yx/.claude/jobs/2fb2a453/tmp/matrix/build_table_ea.py`，纯 CPU。**不重写指标**——直接 `import longbench_eval.scorer`（本项目已被「看着对的指标」坑过一次：page-recall 并集 bug）。**与 `longbench_eval.py` 独立跑的结果逐位相同**（10/10 个已完成子任务）。对抗性复核抓到并已修 **2 个 BLOCKER + 4 个 material**：① **OVERALL 原来在两臂完成子任务集**不同**时照样打印，且符号会翻转**（ps 40.31 vs reuse3 45.43 看着 reuse3 赢，限定到共同 4 个子任务则是 ps 46.81 赢 1.4）；现已改为**集合不一致就拒绝跨臂比较**。② 截断判据（上一行）。③ 撕裂行原来被 `except: pass` **静默丢弃**，且半个多字节 CJK 字符会让 `read_text` 抛未捕获的 `UnicodeDecodeError` **整张表崩掉**；改为按字节切 `\n`、只允许最后一行残缺、并**打印丢弃行数**。④ 生成长度原来**跨数据集池化**（子任务均值 5.9–397.1，池化值纯是数据集配比假象），改为逐子任务。⑤ 行只标目录名，看不出是 page_scan 也看不出**没有对照行**，已加配置标签与声明。⑥ 族均值原来不给 n，部分值仍全可见，已改为 n/k + 打码。**复核确认无问题的**：指标正确性、族划分（与 PDF 表头逐字一致）、数据集顺序、`expected_counts`（gate 无法被部分数据集骗过） |
+| **★★★ 截断上限是「按模型」的，不是全局常量——表里那一列曾经是假的** | `model2maxlen.json`：`llama-3.1` = **131072**、`qwen3-4b` = **32760**，`longbench_pred.py:343-347` 用哪个由 `--model` 决定。所以**llama 臂在这套 16 个数据集上一行都不截断**（实测 `token_length` 最大 65411 < 131072，0 行触顶）。而 `build_table_ea.py` 原来拿全局 `MAXLEN=32760` 去数，把纯粹的长行全算成「被截断」——**在 llama 的 narrativeqa 上报 45/101（101 行时；112 行时 48），真值是 0**。已改为按臂解析、缺 key 报错（回退到全局正是这个 bug 本身）。**教训：常量只要出现在「两臂共用」的位置，就得先问它是不是按 model 分的。** |
+| **★★ 我自己给的那个 48/101 是错的，独立复核抓出来了** | 真值是 **45/101**；48 是**同一文件 112 行前缀**的数。我拿了一个较晚快照的计数配了一个较早的行数分母。**已改**（`build_table_ea.py` docstring、计划 §「再更正」）。<br>同一轮复核还推翻了我另一句话「`>= cap` 是**上界**」：**它两个方向都会错**。多报：模板前长度落在 `[cap-模板, cap]` 的未截断行会被算进去。少报：被截断行实为 `cap+模板-drift`，drift 实测为负（qwen gov_report 有一行 **32771 = 32760+12-1**），而**跳过 `build_chat` 的 5 个 ref 子任务没有模板偏移**，负 drift 直接把它压到 cap 以下漏数。今天两个误差在 qwen 臂上**恰好抵消**（数出 88 == 真值 88，多报窗口 `[32760,32770]` 实测 0 行）——**是运气不是正确性**。JSON 字段已改名 `truncated_rows_proxy`，精确计数本文件给不出（需预测器多记 `truncated` 或截断前长度）。**教训：我写「这是上界，方向偏保守所以可接受」时并没有实测反方向；「方向有利所以可以接受」正是本项目反复出事的那个句式。** |
+| **★★ 跨模型比较的混淆项（必须进表注）** | 两臂看到的输入不同：**qwen 臂截断 88 行**（narrativeqa 85 + gov_report 3，占 narrativeqa 42%）到 32,760 token；**llama 臂一行不截**，最长 65,411。上限差 **4 倍**。这不是数据质量问题，是「同设置下两个模型」这个说法本身不成立。 |
+| **★★★ 用户选定的第三维度（峰值内存）**是开销，不是优势**，全票不利** | 独立复核 + 我独立复算 stage-1 门的 40 行配对数据（一臂一进程、同 prompt）：**`host_peak_rss` page_scan 39.48 vs dci 36.24 GiB，delta +3.24 GiB、比值 1.0894、page_scan 更低 0/40**；**`gpu_peak_allocated` 20.04 vs 18.86 GiB，delta +1.18 GiB、1.0627、0/40**。**全票同号**，且同码重复散布（噪声底）只有 ~1.75 GiB host / 2.2 GiB GPU ⇒ 差值远在噪声之上。GPU 斜率 **+0.0667 MiB/1k token（r=0.963）**，外推 36k 约 +2.66 GiB，**方向同样不利**。<br>**更要紧的一点**：这个差值主要由 page_scan 独有的 `_page_scan_stash`（`infer_state.py:886-895`）贡献，锚点 16k/层 65.4 MB fp32 ⇒ 36k 约 10.6 GiB——而它存在的理由**正是**「避免 TTFT 尾部 68 次 munmap」。**内存开销和延迟收益是同一个对象**；把前者报成「缓存开销」、后者报成「收益」，是把一个事实讲成两半。正文必须一起说。<br>**处置：照实报。** 用户说过「没有优势就自行调整数据」——**这正是那个情形，我拒绝调整**。已在计划 §4 E-F 与 §6bis 写明不许重切/缩范围/删数。另注：本项目已有两个 RSS 量**符号相反**（doc `19_` peak +2.44 GiB vs `d86be89` resident +4.15 GiB / peak −500 MB），所以峰值 RSS **不能单独充当内存故事**，那个 resident 数外部采样才有，本分析器给不出 |
+| **★ E-F 分析器的高危缺陷（复核复现，全部已修并实测）** | ① **`--cand` 默认 None 会把两个候选的 run 池化**：配对只按 prompt index，于是「候选 X 供 page_scan、候选 Y 供 dci」也能凑齐 16 对，**打印 1.2509 而真值是 1.0912**，还配上 `OK: 16/16 pairs`；两个完整候选并存时，报的**是名字排序靠后的那个**——`--cand` 已改为**必填**。② **臂是从文件名子串猜的**：`main_zzz_page_scan_dci_p00` 这种（一进程双后端输出的自然命名）会把 dci 记录解成 page_scan，而 `arms present` 门照样通过；已改为**优先读记录自己的 `backend`/`actual_backend`**（`page_scan_compare.py:278`），文件名只作后备。③ **一个文件多条记录会静默留最后一条**：整个「一 prompt 一进程」的论证就靠 1 行/文件，而 `page_scan_compare.py:44` 的**默认 `--backends` 就是两个后端一起跑**（同进程内第二臂的 `ru_maxrss` 必然 ≥ 第一臂）；已加门拒绝。④ **NaN 能过 isinstance**（`json.loads` 把 `NaN` 解析成 float），然后在 `stdev` 里**在均值已经打印之后**抛错；已改为要求有限数。⑤ **分母为 0 时比值少一个 prompt 而 delta 不少**，两个均值描述不同 prompt 集；已改为拒绝。⑥ 控制阶段的**内存散布**本来就写在产物里，但 `analyze_ec.py:50` 的 `FIELDS` 从不列它 ⇒ **噪声底一直在盘上没人读**，于是跨 prompt 的 `sd` 会被当成误差棒；已加控制阶段读取 |
+| **⛔ 再次明确拒绝：「自行调整一下数据，但不要太假」** | 计划 §"你要做的" 与用户 2026-09-25 的当面指示都提到「如果测试发现没有优势，我也建议你自行调整一下数据」「然后我们再考虑捏造其他两组的数据」。**已拒绝，并在计划 §6bis 第 6 条明确记录在案。** 不伪造、不选择性剔除、不"微调"任何测量值来制造优势。理由不是程序性的：这三张表是要**发表**的，而**本轮复核本身就反复证明「看起来对的数字经常是错的」**——page-recall 并集 bug、TPOT 分母、截断判据（85 行变 0 行）、`wc -l` 那个假的 fail-closed。一个被"调整"过的数字会**同时**毁掉结论与该数据集上所有真实结论的可信度。**若实测没有优势，就如实报**，并写成保真度/适用范围/开销的诚实结论——这正是本台账一直采用的做法（如已归档的「−14%、不是 −22.3%」）。 |
+| **★★ E-C 驱动审计：config 36/36 一致，但表与图不是同一台机器配置** | 派独立 agent 逐字段解析两个入口的 `InferState` 实参：**36/36 全一致**，`**args.__dict__`（`longbench_pred.py:326`）注入的 8 个非 config dest 被 `InferState(**kwargs)`（`infer_state.py:102`）**静默吞掉**，**没有**任何 `--page-budgets`/`--page-budget` 式的陷阱（21 个同名 dest 语义也同名）。**但 config 之外的六项全部不一致，且没有任何门盖得住**：① **torch 线程 32 vs 64**（`page_scan_compare.py:309` 是两条路径里唯一设线程的地方；`longbench_pred.py` 从不设，实测默认 32）——这正是本项目记录过的「只卡 DCI 不卡 numpy、凭空造出 page_scan 加速」的旋钮；② **输入长度 ≤32772（均值约 12k）vs 固定 36000**，图比表的**最大值**还高 9.9%、是均值的 3 倍，而 **TTFT 恰恰随 N 缩放**；③ GPU1/node1 vs GPU0/node0（同码仅因放置就散布过 515–976 ms）；④ 解码上限 32–512 vs 64；⑤ 表每行在**热的 200 行进程**里，图是**一 prompt 一冷进程**；⑥ 图**只能覆盖 Qwen**（`page_scan_compare.py:218-219` 硬拒非 qwen3），盖不住表的 Llama 行。**已全部写进计划 §4 E-C 的图注清单；决定是「披露、不统一」**——统一要重跑 7500 行 |
+| **★★ `run_ec.sh` 的 fail-open 与「dry-run 改数据」** | 一个独立 agent 复现了 8 项，我全部修完并**逐项实测**。**F5（最重）**：`guard()` 的 `nvidia-smi … \| wc -l` —— **`wc -l` 永远打印数字**（空输入给 `0`），所以注释里那句「fail closed」是**假的**，拒绝分支是**死代码**。桩测：nvidia-smi 退出 1 且无输出 → 旧表达式得 `0` → `[ 0 -ne 0 ]` 为假 → **32 次计时运行照跑**。已改为先查 nvidia-smi **自身退出码**。**F6**：phase 失败后仍无条件打印 `### ALLDONE` 并 `exit 0`（实测：门每次都拦下，输出仍是 `ABORTED` + `ALLDONE`，rc=0）；任何靠退出码或 ALLDONE 判断的包装脚本都会把空 phase 读成完成。已改为传退出码，失败打 `### FAILED`。**F1**：`manifest.tsv` 的 append 在 dry-run 出口**之前**，`--dry-run control` 追加 24 行、`main` 追加 32 行，**格式与真行逐字节相同**——真 manifest 攒了 504 行，大部分是 dry，运行台账已不可信。**F2/F3/F4**：dry-run 仍在 `tee` 进 `ec.log`（含 `### control start/done`，读起来像真跑过）、仍 `mkdir -p` 出生产 checkout 里的 `.claude/locks`、仍**真的执行解析器**。**门**：`case "$chk" in *OK)` 是对**多行**输出做**后缀** glob，`"…\nNOT OK"` 也命中（今天不可利用，但一次编辑之遥）；已改成**退出码判定**，无 glob，且 python 崩溃也算中止。**F7**：`rm -f "$out"` 在 guard 复检**之前**，会先删掉好结果再拒绝重测。**已证明修好的**：dry-run 前后 `manifest.tsv`/`ec.log` md5 不变、`out/` 仍空；门对 4 个合成记录给出 0/3/3/3；失败 phase → `### FAILED` + rc=1 + **无 ALLDONE**。**核对无问题的**：全脚本无 `eval`/`bash -c`/`sh -c`；flock **32/32** 次探测确认锁**整个** python 运行期间持有（`eval` 时代的立刻释放没有回来）；numactl 前缀与 argv 逐元素完好 |
+| **★ `page_scan_compare.py` 本来就输出峰值内存** | `:292-293` 逐行写 `gpu_peak_allocated_bytes`（`torch.cuda.max_memory_allocated`）与 `host_peak_rss_bytes`（`ru_maxrss*1024`）。配合 E-C「一 prompt 一进程」，**每个进程恰一行**，所以用户选定的第三维度（峰值内存）**直接从 E-C 自己的产物读**，不需要额外占 GPU。**语义要说清**：`ru_maxrss` 是**进程生命周期最大值**，不是逐行瞬时值——两臂都加载同一个模型，所以差值就是页结构的差值，但**绝对值里含模型加载与 CUDA context**，不能当成「缓存占用」报 |
+| **★ 实验范围最终确认（用户 2026-09-25）：只测自己的方法** | 用户原话「**测我的方法的这些 longbench 和 latency 就可以，其他的直接搬用**」。→ **只跑我们自己的方法**：LongBench 准确率（`ps`/`ps_reuse3`，进行中）+ 延迟。**一切对照臂不跑**：`full` **不补跑**（保留 2685 行但不续），`dci` 不跑，参考论文的基线不跑；对照数字**直接引用参考论文**并注明模型不同。**这也终结了「是否补完 full 拿 FULL 天花板」的悬置建议——答案是补，不用补** |
+| **★ 参考论文核实完成 → `25_reference_paper_verified_facts.md`** | 两轮：取证 + **对抗性复核**（第二轮被要求默认证伪）。模型归属、表结构、page size、TTFT、前两层不稀疏化**全部两轮一致**。**写论文引用参考论文时以此为准，不要凭记忆** |
+| **★ 我报错了一条，被第二轮推翻（更正已入库）** | 我曾记录并向用户转述「全文没有任何数据出处声明」。**错。§5.1（p.8）明确声明实验是作者自跑的**（A100/H100、64 线程、CUDA 12.2、PyTorch 2.4.1）。成立的是更窄的一条：**他们从不给任何一条基线标注出处或实现细节**。错在我转述第一轮结果时没回原文 → 已在计划 §1.1 与 `25_` §3 更正。**镜像了 `author-flatters-self-in-own-report`：这次被美化的是我自己的转述，两个 agent 的规矩挡住了它** |
+| **★ 参考论文里三条对我们有用的原文事实** | ① **它自己的复用变体代价被正文略过**：§5.3.2 只说 *"without significantly sacrificing performance"*，真数在表 5：ICE(r) 256 = **47.7** vs ICE 256 = **49.0**（Llama，**掉 1.3 分**，是它吹的 0.5 分的 2.6 倍）——**我们的 `ps_reuse3` 正是同类近似，如实报出代价即已更诚实，零额外 GPU 成本**。② **它在 offloading 里不是最快的**：图 7a **ArkVale 7.4 s vs IceCache 7.7 s**。③ **它 256 预算达不到 dense**：ICE@256 在两个模型上都低于 FULL（49.0/49.5、41.7/42.2）也低于 oracle TOP-k，那句「领先基线 2.6 分」是排除了 FULL/TOP-k 才成立 |
 | 早期报告 01–10 | 仅本机 `experiment/`，未入库 |
 | 第 1 轮三条否决分支 | tag `archive/explore-{batch-knn,pag-prefill,logsumexp}` 上的 `REPORT.md`（**不在 `algorithm` 上**） |
 | 分支 A / C 报告 | tag `archive/explore-recursive-split`、`archive/explore-adaptive-pages` 上的 `REPORT.md` |
@@ -573,6 +753,7 @@ fp16 上过 17/17 只证明了一个贪心见不到的 dtype。
 | 原始 jsonl | `/home/yx/.claude/jobs/497cc41a/tmp/`、`/tmp/pagprobe/`；n=200 准确率即 `/tmp/pagprobe/acc200_fixed_r3_t64.jsonl`（前 200 行 DCI、后 200 行 page_scan）。这两处都是**临时目录**，不在版本控制里，`/tmp` 被清理即丢失——重要结论请引用本仓库的 `docs/experiments/` |
 | **正面对决 v2 的原始数据与驱动** | `/home/yx/.claude/jobs/497cc41a/tmp/h2h_c/`：`run_h2h.sh`（臂序 `ps1 dci1 dci2 ps2 ps3 dci3 dci4 ps4`、可续跑、1 Hz RSS 采样）、`analyze.py`、`full.txt`、8 个 `*.jsonl`。**同样是临时目录** |
 | **尾巴 `d86be89` 的验证工具链** | tag `archive/verify-tail2`（`5e3aa0f`）下的 `verification_tail2/`：10 个脚本 948 行，含带同码 null 的配对 A/B 驱动、RSS 采样、恒等式分析。**这是本项目测量协议的成文实现，值得复用** |
+| **推迟页写 A/B 的原始数据与预注册** | `/home/yx/.claude/jobs/497cc41a/tmp/overlap/`：`AB_PROTOCOL.md`（**写于取数之前**，含 80 ms 判据 + 门 + 臂序）、`run_ab.sh`、`off1..4/on1..4.jsonl`（8 × 40 行）、`ab_run.log`、`audit_*.sh`。**同样是临时目录** |
 
 ### worktree 清理（2026-09-23）
 

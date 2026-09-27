@@ -151,6 +151,72 @@ python gsm8k_pred.py \
     --model mistral-7b-inst
 ```
 
+### page_scan Decode-Time Breakdown
+
+```bash
+cd IceCache/benchmark        # run it where page_scan_compare.py is run
+python page_scan_breakdown.py \
+    --model <hf-id-or-path> \
+    --backends page_scan \
+    --prompt-file prompt.txt \
+    --max-input-tokens 36864 \
+    --max-new-tokens 64 \
+    --page-size 16 \
+    --page-budget 16 \
+    --page-topk 0 \
+    --n-reuse-layers 0 \
+    --inject-pages off \
+    --threads 64 \
+    --output row.jsonl \
+    --probe-out breakdown.json
+```
+
+That is the full flag set of the arm this probe is used for — pass the flags of the
+arm being decomposed, since the breakdown is only meaningful for the configuration
+that was actually run. `--max-input-tokens` in particular: the harness default
+(32760) silently truncates the 36k prompt this probe is used with. The `cd` is part
+of the recipe, not decoration: the probe is run where `page_scan_compare.py` is run,
+from `IceCache/benchmark` — from the repo root the invocation is a plain
+file-not-found.
+
+`page_scan_breakdown.py` runs `page_scan_compare.py` in-process (same model, prompt,
+seed and generation settings as a normal run) with CUDA-event wrappers on the live
+decode path, and splits a page_scan decode token into four buckets:
+
+- **Query** — the GPU page scan (`bmm` / mask / `topk` / dedup), the selected-page H2D and the result D2H.
+- **Loading** — staging the retrieved pages: host address gather, `copy_to_buffer`, and the H2D/D2D into the KV pool on its own CUDA stream.
+- **Decoding** — attention over the stitched cache plus each layer's MLP.
+- **Others** — the residual of the token interval: projections, rope, norms, the KV scatter, lm_head, sampling and host Python.
+
+The four buckets are **CUDA-event intervals on the device timeline, not host
+timings**. Host timing is misleading on this path: `PageScan.query` ends in a
+`.cpu()` copy that drains the default stream, so a host clock around it also absorbs
+the previous layer's attention and MLP, and the attention/MLP kernels themselves are
+pure launches whose host time is only launch overhead. The event pairs add no
+synchronisation, but they are not free: at a few hundred event records per token the
+probe perturbs the host-timed `tpot_s` it also reports. Measured on this box, a probe
+row's host `tpot_s` is 112.2–113.6 ms against the **clean 4-pass mean of 89.53 ms**
+(range 87.4–94.5) for the same config with the probe off, i.e. **+26%**; the control
+that shows the device work itself is unperturbed is the probe's own device frame
+`d:attn_frame`, which reads 88.9–90.2 ms in those same runs, within 1% of clean. A
+probe row's own `tpot_s` / `ttft_s` must therefore not be quoted as a clean number,
+and the number to use is the frame-denominated share set below, not the
+interval-denominated one.
+
+Two share sets are emitted, on two denominators, and only one of them is usable:
+
+- `rows[].means.frame_shares_pct` — **the one to plot.** Printed as `share of the
+  device frame d:attn_frame`. Numerator buckets and denominator are all CUDA device
+  intervals, so the probe's own host cost cannot inflate either.
+- `rows[].means.shares_pct` — printed as `share of the mean interval`. The
+  denominator is the harness host interval, which contains the probe's own wrapper
+  cost: inflated, do not plot.
+
+The wrappers also measure their own host cost (`rows[].wrapper_host` in the JSON,
+the `probe overhead (MEASURED ...)` lines in the log), split into the part charged
+inside the `d:attn_frame` interval and the part outside it — that split is what
+bounds the frame denominator's own inflation.
+
 ## Key Parameters
 
 | Parameter | Description |

@@ -83,6 +83,13 @@ DEFAULT_RESERVE_PAGES = 64
 # emitted pages -- rounded up to a comfortable 8 pages = 128 tokens per head.
 DEFAULT_RESERVE_MARGIN_PAGES = 8
 
+# Cap on the transient `blk * blk` a row-chunked norms pass may materialise (see
+# `_row_sq_norms`). 512 MiB is ~1.3% of the 38.9 GiB key tensor it walks at
+# 300k tokens, so the chunking costs a handful of extra launches and nothing
+# else, and it is small enough to fit whatever headroom is left after the device
+# page pool -- including inside the 3x peak the group sizing budgets.
+_NORMS_CHUNK_BYTES = 512 << 20
+
 
 def reserve_pages_for(generation_reserve_tokens, page_size,
                       margin_pages=DEFAULT_RESERVE_MARGIN_PAGES):
@@ -289,6 +296,61 @@ def _live_token_index(assigned, n_live):
     return buf[:, :n_live]
 
 
+def _row_sq_norms(k, chunk_bytes=_NORMS_CHUNK_BYTES):
+    """``(k * k).sum(-1)`` over ``[M, N, D]``, in row chunks of bounded size.
+
+    The returned tensor is ``[M, N]`` in ``k``'s own dtype, with the same bytes
+    the one-shot expression produces. That is the whole contract: ``norms``
+    drives ``torch.argmax(norms.masked_fill(assigned, neg), dim=1)``, so one
+    differing last bit in one row can move a seed, and the partition is what the
+    design's accuracy rides on.
+
+    Exactness. The reduction is over the last dim, so row ``m`` of the result is
+    a function of ``k[m]`` alone -- there is no cross-row term and no row is
+    split across chunks. ``(blk * blk).sum(-1)`` with ``blk = k[i:i+CH]``
+    therefore touches exactly the elements of those rows, in exactly the order
+    the full expression does, and a per-row result cannot depend on which other
+    rows were in the operand. No dtype promotion anywhere: ``blk * blk`` is
+    ``k.dtype``, ``sum(-1)`` of it is ``k.dtype``, and the target slice of the
+    preallocated output is the same dtype, so no implicit cast is inserted.
+
+    On CUDA there is one further way a chunk *could* differ -- the reduce kernel
+    picks its vectorization from the operand's alignment -- and it does not bite
+    here: the row stride is ``D * k.element_size()`` = 512 B for the production
+    fp32 / head_dim 128, so ``k[i:i+CH]`` always starts on the same 16-B boundary
+    the full tensor does. (This is arithmetic on the shape, not a measurement.)
+
+    What it is for. ``(k * k)`` materialises a full ``[M, N, D]`` temporary in
+    ``k``'s dtype -- the *same* size as ``k`` itself, 19.43 GiB for the 272-row
+    batch at 150000 tokens and 38.9 GiB at 300k (34 builder layers x 8 heads x
+    N x 128 x 4 B). Chunking caps that transient at ``_NORMS_CHUNK_BYTES``
+    whatever ``M`` is, so the norms pass holds one full-size tensor instead of
+    two.
+
+    It is **not** the allocation the 150k OOM landed on, and was not claimed to
+    be here by anything but a shifted traceback line. A gc storage dump taken at
+    that failure (one row, 34 builders, M=272, N=149824) shows the temporary
+    long gone and the peak owned by three *other* full-size tensors -- ``keys``
+    19.432 GiB, the ``live_k`` gather 19.150 GiB and an 18.87 GiB bmm operand
+    materialisation. The grouping in ``InferState._page_scan_flush`` is what
+    budgets that peak; this only removes a transient of the same order that
+    every build pays at the top.
+
+    ``k`` may be non-contiguous (``build_from_packed`` does not require it);
+    slicing rows keeps it that way and is a view either way. Nothing here calls
+    ``.contiguous()`` on the whole tensor.
+    """
+    M, N, D = k.shape
+    itemsize = k.element_size()
+    out = torch.empty((M, N), dtype=k.dtype, device=k.device)
+    # At least one row per chunk: a chunk of zero rows would be a silent hole.
+    chunk = max(1, int(chunk_bytes) // max(1, N * D * itemsize))
+    for i in range(0, M, chunk):
+        blk = k[i:i + chunk]                                   # a view
+        out[i:i + chunk] = (blk * blk).sum(-1)
+    return out
+
+
 def _greedy_packed_pages_live(k, page_size, span=None):
     """``use_sim=False`` greedy that rescans only the tokens it can still use.
 
@@ -333,7 +395,12 @@ def _greedy_packed_pages_live(k, page_size, span=None):
     n_built = -(-N // page_size)
     heads = torch.arange(M, device=k.device)
     head_col = heads.unsqueeze(1)                             # [M, 1]
-    norms = (k * k).sum(-1)                                   # [M, N]
+    # Row-chunked, and bit-identical to the `(k * k).sum(-1)` it replaces: this
+    # is the one line in the build that owns a full [M, N, D] temporary of its
+    # own, and chunking it is what keeps a group's peak at 3x its keys tensor
+    # rather than 4x. See `_row_sq_norms` and, for the 3x, the peak factor in
+    # InferState._page_scan_group_layers.
+    norms = _row_sq_norms(k)                                  # [M, N]
     packed = torch.full((M, N), -1, dtype=torch.int32, device=k.device)
     assigned = torch.zeros((M, N), dtype=torch.bool, device=k.device)
     neg = float("-inf")

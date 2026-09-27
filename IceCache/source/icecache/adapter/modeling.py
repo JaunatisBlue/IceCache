@@ -48,6 +48,37 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+def _repeat_kv_heads(key_states, value_states, rep):
+    """Repeat each KV head ``rep`` times, so the kernels see group size 1.
+
+    The paged kernels dispatch on the GQA group size, ``num_qo_heads /
+    num_kv_heads``, and this build's generated table only instantiates
+    {1, 4, 8} (``icecache_cpp/src/generated/dispatch.inc``). A model outside
+    that set -- Qwen2.5-7B, 28 query heads over 4 KV heads -- has no kernel at
+    all and dies at the first prefill with "failed to dispatch group_size 7".
+    Expanding the K/V *tensors* rather than generating a kernel is what stock
+    GQA attention does anyway: HF's ``repeat_kv`` repeats each KV head over the
+    consecutive block of query heads that shares it, so expanded head
+    ``h * rep + r`` is the KV head that query head ``h * rep + r`` attended to
+    before the expansion, and attention is unchanged. The cost is ``rep`` x the
+    KV cache -- and, for the retrieval backends, ``rep`` x the instances each
+    layer builds -- paid only by models the kernels cannot serve as-is.
+
+    ``rep == 1``, i.e. every model whose native group size is already 1, 4 or 8,
+    returns the inputs untouched: this is a strict no-op for them.
+    """
+    if rep == 1:
+        return key_states, value_states
+    # `repeat_kv` takes and returns [bsz, n_kv_heads, seq_len, head_dim], which is
+    # exactly the K layout here; it also documents itself as
+    # `repeat_interleave(x, dim=1, repeats=rep)`. V is [bsz, seq_len,
+    # n_kv_heads, head_dim] -- its head axis is dim 2, not dim 1 -- so it cannot
+    # go through `repeat_kv`, and `repeat_interleave` on dim 2 gives the same
+    # ordering: head h repeated rep times in place, i.e. repeat_kv's
+    # (h, r) -> h * rep + r. qwen3's k_norm does not change the layout.
+    return repeat_kv(key_states, rep), torch.repeat_interleave(value_states, rep, dim=2)
+
+
 def _icecache_prefill(
     self: LlamaAttention,
     hidden_states: torch.Tensor,
@@ -112,6 +143,12 @@ def _icecache_prefill(
     value_states = value_states.view(
         bsz, q_len, self.config.num_key_value_heads, self.head_dim
     )
+
+    # Present full multi-head K/V when the model's group size is one the kernels
+    # lack; no-op at rep 1. Everything downstream reads the head count from
+    # `state.n_kv_heads`, which the expansion below makes the tensor agree with.
+    key_states, value_states = _repeat_kv_heads(
+        key_states, value_states, state.kv_head_rep)
 
     kvc = state.kv_caches[cur_id]
 
@@ -248,6 +285,12 @@ def _icecache_decode(
         bsz, q_len, self.config.num_key_value_heads, self.head_dim
     )
 
+    # Same expansion as prefill -- decode inserts one token per step into the
+    # same cache, so its head count must match what prefill laid out. No-op at
+    # rep 1.
+    key_states, value_states = _repeat_kv_heads(
+        key_states, value_states, state.kv_head_rep)
+
     kvc = state.kv_caches[cur_id]
     budget = state.layer2budget[cur_id]
 
@@ -276,14 +319,63 @@ def _icecache_decode(
             eids, nr = state._dci_future.result() # (timeout=1)
             state._dci_future = None
 
-            state.scatter_pages(cur_id, eids, nr)
+            # `estimate_select_recall` returns (None, None) BY DESIGN when there is
+            # nothing to select -- see its own `if eids is not None:` guard. That
+            # guard is repeated at both call sites here because `scatter_pages`
+            # forwards straight into the pybind11 binding, which requires four
+            # tensors and raises `TypeError: scatter_pages(): incompatible function
+            # arguments` on a None.
+            #
+            # Measured trigger (2026-09-26): a prompt of <= budget*page_size tokens
+            # (= 256 at page_size 16 / budget 16) makes `prefill_evict_extra_pages`
+            # take its `else: self.use_dci = False` branch -- nothing to offload --
+            # and then the first decode step that pushes seq_len past 256 hits the
+            # same `None` at the `else` site below, which is the one the traceback
+            # names. This receive branch sees it only when n_prefetch_layers > 0
+            # (it is 0 in every harness here). Deterministic, not a race: it killed
+            # the llama-3.1 `multi_news` run at row 96, whose log line reads
+            # `Context length: 222`.
+            #
+            # The threshold 256 comes from the code above, NOT from the log. The
+            # 95 surviving rows all had token_length >= 505, but they are a
+            # dataset-order prefix, so that is survivorship and cannot pin a
+            # threshold -- anything in (222, 505] fits the same evidence.
+            if eids is not None:
+                state.scatter_pages(cur_id, eids, nr)
+            else:
+                # Keep the invariant loud. This guard is only correct because
+                # `use_dci = False` means the machinery is off for this row. If
+                # `eids` is None while `use_dci` is True, something else went
+                # wrong (the caller tests `n_pages > budget`, the callee tests
+                # `n_real_pages == budget` -- different quantities that today
+                # coincide), and skipping the scatter would silently decode with
+                # the previous token's recalled pages still in place.
+                assert not state.use_dci, (
+                    f"scatter_pages got eids=None while use_dci is True "
+                    f"(layer {cur_id}); the caller/callee budget conditions have "
+                    f"diverged. Refusing to skip silently.")
         else:
             raise NotImplemented("kv cache is expected in the receive state")
     else:
         if budget is not None and kvc.n_pages > budget:
             eids, nr = state.estimate_select_recall(cur_id, query_states)
-            
-            state.scatter_pages(cur_id, eids, nr)
+
+            # Guarded for the same reason as the receive branch above -- and this
+            # is the call site that actually crashed: the pre-fix traceback names
+            # `modeling.py, line 286`, which is this statement (`git show HEAD:`
+            # then line 286; the guard is uncommitted).
+            #
+            # `use_dci = False` means the whole retrieval machinery is off for
+            # this row -- `decode_sdpa` branches on the same flag and
+            # `estimate_select_recall` is gated on it -- so there is nothing
+            # selected and nothing to scatter. A no-op is the intended meaning.
+            if eids is not None:
+                state.scatter_pages(cur_id, eids, nr)
+            else:
+                assert not state.use_dci, (
+                    f"scatter_pages got eids=None while use_dci is True "
+                    f"(layer {cur_id}); the caller/callee budget conditions have "
+                    f"diverged. Refusing to skip silently.")
 
     if do_send_pf:
         query_states1 = (
@@ -391,11 +483,29 @@ def enable_icecache(
 ):
     if infer_state is None:
         config = self.model.config
+        # `rep` is the model's GQA group size -- what the kernel dispatch calls
+        # group_size -- and the kernels only cover {1, 4, 8}. Presenting full
+        # multi-head K/V (group size 1) for anything else is what keeps a model
+        # like Qwen2.5-7B (28 q / 4 kv) off the "failed to dispatch group_size
+        # 7" path; `_repeat_kv_heads` does the repeating, here and in decode.
+        n_qo_heads = config.num_attention_heads
+        n_kv_heads = config.num_key_value_heads
+        assert n_qo_heads % n_kv_heads == 0, (
+            f"num_attention_heads ({n_qo_heads}) is not a multiple of "
+            f"num_key_value_heads ({n_kv_heads})")
+        rep = n_qo_heads // n_kv_heads
+        # 1 means "do not expand": the supported ratios keep the config's own
+        # head count and every head-indexed tensor, byte for byte, as before.
+        kv_head_rep = 1 if rep in (1, 4, 8) else rep
         infer_state = InferState(
             n_layers=config.num_hidden_layers,
-            n_qo_heads=config.num_attention_heads,
-            n_kv_heads=config.num_key_value_heads,
-            head_dim=config.head_dim if config.head_dim is not None else config.hidden_size // config.num_attention_heads,
+            n_qo_heads=n_qo_heads,
+            n_kv_heads=n_kv_heads * kv_head_rep,
+            kv_head_rep=kv_head_rep,
+            # `head_dim` is absent on Qwen2Config and None on MistralConfig; `or`
+            # covers both, while a config that sets it (Qwen3-4B: 128 vs an 80-wide
+            # hidden_size/num_attention_heads) keeps it verbatim.
+            head_dim=getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads,
             page_size=page_size,
             dtype=dtype,
             device=device,

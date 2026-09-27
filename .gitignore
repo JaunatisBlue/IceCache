@@ -18,3 +18,7 @@ IceCache/source/icecache/_mdci_batch.cpython-310-x86_64-linux-gnu.so
 code_ref/
 PAG/
 .claude/
+paper/
+IceCache/experiment/
+IceCache_ Memory-efficient KV-cache Management for Long-Sequence LLMs.pdf
+docs/experiments/*
