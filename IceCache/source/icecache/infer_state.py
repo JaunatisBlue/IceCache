@@ -11,6 +11,7 @@ from torch import Tensor
 from .kv_cache import KvPool, KvCache
 from . import kernels
 from . import utils
+from .retrieval import query_candidate_provider, validate_leaf_ids
 
 import icecache_cpp as _cpp
 
@@ -55,6 +56,8 @@ class InferState:
         debug=False,
         ratio_1=0.01,
         ratio_2=0.2,
+        dci_observer=None,
+        dci_candidate_provider=None,
         **kwargs,
     ) -> None:
         self.n_layers = n_layers
@@ -75,6 +78,12 @@ class InferState:
         self.debug = debug
         self.use_dci = True
         self.parallel_level = 2
+        self.dci_observer = dci_observer
+        self.dci_candidate_provider = dci_candidate_provider
+        if dci_candidate_provider is not None and n_prefetch_layers:
+            raise ValueError(
+                "custom DCI candidate providers do not yet support layer prefetch"
+            )
 
         if n_max_pages is None:
             assert n_max_bytes is not None
@@ -116,6 +125,7 @@ class InferState:
         self.use_sparse_attn = use_sparse_attn
         self.page_valid_entries = [None] * n_layers
         self.selected_page_idx = [None] * n_layers
+        self.dci_candidate_plans = [None] * n_layers
 
         self.cpu_n_bytes_per_page = 2 * page_size * \
             n_kv_heads * head_dim * self.cpu_dtype.itemsize
@@ -250,6 +260,11 @@ class InferState:
         self.group_size = group_size
         self.n_groups = n_groups
 
+    def _notify_dci(self, event: str, **payload) -> None:
+        """Publish an optional read-only event without affecting default execution."""
+        if self.dci_observer is not None:
+            self.dci_observer.on_dci_event(event, state=self, **payload)
+
     @property
     def seq_len(self):
         return self.kv_caches[0].seq_len
@@ -282,6 +297,7 @@ class InferState:
         self.prefill_backup_events = [None] * self.n_layers
         self.prefill_evicted_pages = [None] * self.n_layers
         self.selected_page_idx = [None] * self.n_layers
+        self.dci_candidate_plans = [None] * self.n_layers
         self.kv_caches = [None] * self.n_layers
         self.cpu_kv_caches = [None] * self.n_layers
         self.temp_cpu_kv_caches = [None] * self.n_layers
@@ -448,6 +464,12 @@ class InferState:
             raise
 
     def _finish_prefill(self, bsz, q_len):
+        # Each attention layer waits for the previous asynchronous DCI build,
+        # but the final layer has no successor to drain its future. Complete it
+        # before decode can query or scatter pages from that layer.
+        if self._dci_future is not None:
+            self._dci_future.result()
+            self._dci_future = None
         for b, ls in self.budget2layers.items():
             n_kv_pages = utils.all_eq(
                 self.kv_caches[l].n_real_pages for l in ls)
@@ -554,6 +576,12 @@ class InferState:
                 assert (projected.flags['C_CONTIGUOUS'])
 
                 num_neighbours = self.n_dci_pages - self.layer2topk[cur_id]
+                if num_neighbours <= 0:
+                    raise ValueError(
+                        f"layer {cur_id} has {self.n_dci_pages} DCI-resident pages "
+                        f"but page_topk={self.layer2topk[cur_id]}; the resulting "
+                        "candidate count must be positive"
+                    )
                 query_field_of_view = 30
                 construction_field_of_view = 30
                 construction_prop_to_retrieve = 1.0
@@ -654,6 +682,13 @@ class InferState:
                     self.page_address_buffer[cur_id][b, i, :dci_db.num_leaves[i]] = np.array(tmp_addr, dtype=np.uintp)
                 
                 DCI.reuse_copy_node(p_index=old_index, p_offset=old_offset, keys=_key_states, values=_value_states, new_address=[cast(_base + i * head_offset, c_void_p).value for i in range(self.n_kv_heads)], kv_offset=self.n_kv_heads*self.page_size*self.head_dim)
+
+            self._notify_dci(
+                "build",
+                layer_idx=cur_id,
+                key_states=key_states,
+                dci_db=dci_db,
+            )
 
 
     def _DCI_add(self, b, cur_id, key_states, value_states):
@@ -790,6 +825,13 @@ class InferState:
                 new_index, new_offset = dci_db.token2node
                 DCI.reuse_update_node(old_index=old_index, old_offset=old_offset, new_index=new_index, new_offset=new_offset, keys=_key_states, values=_value_states, new_address=self.page_address_buffer[cur_id][0], kv_offset=self.n_kv_heads*self.page_size*self.head_dim, ccc=reuse_ccc, num_leaves=dci_db.num_leaves)
 
+            self._notify_dci(
+                "add",
+                layer_idx=cur_id,
+                key_states=key_states,
+                dci_db=dci_db,
+            )
+
 
     def _DCI_query(self, b, cur_id, query_states):
         if self.use_dci:
@@ -797,6 +839,12 @@ class InferState:
             bsz = 1
 
             num_neighbours = self.n_dci_pages - self.layer2topk[cur_id]
+            if num_neighbours <= 0:
+                raise ValueError(
+                    f"layer {cur_id} has {self.n_dci_pages} DCI-resident pages "
+                    f"but page_topk={self.layer2topk[cur_id]}; the resulting "
+                    "candidate count must be positive"
+                )
             query_field_of_view = max(
                 int((self.seq_len) * self.search_ratio), 30)
             query_prop_to_retrieve = 0.8
@@ -815,35 +863,69 @@ class InferState:
 
             assert (_query.flags['C_CONTIGUOUS'])
 
-            nn_idx, _ = self.dci_db[cur_id].query(_query,
-                                                padding_mask,
-                                                num_neighbours=num_neighbours,
-                                                field_of_view=query_field_of_view,
-                                                num_to_visit=num_to_visit,
-                                                num_to_retrieve=num_to_retrieve,
-                                                prop_to_visit=prop_to_visit,
-                                                prop_to_retrieve=query_prop_to_retrieve,
-                                                parallel_level=self.parallel_level,
-                                                ratio=self.ratio,
-                                            )
+            if self.dci_candidate_provider is None:
+                self.dci_candidate_plans[cur_id] = None
+                nn_idx, _ = self.dci_db[cur_id].query(
+                    _query,
+                    padding_mask,
+                    num_neighbours=num_neighbours,
+                    field_of_view=query_field_of_view,
+                    num_to_visit=num_to_visit,
+                    num_to_retrieve=num_to_retrieve,
+                    prop_to_visit=prop_to_visit,
+                    prop_to_retrieve=query_prop_to_retrieve,
+                    parallel_level=self.parallel_level,
+                    ratio=self.ratio,
+                )
 
-            nn_idx = nn_idx.reshape(self.n_qo_heads, 2, -1)
-            nn_idx_0 = nn_idx[:, 0, :].reshape(self.n_kv_heads, self.ratio, -1)
-            nn_idx_1 = nn_idx[:, 1, :].reshape(self.n_kv_heads, self.ratio, -1)
-            if self.n_prefetch_layers > 1:
-                self.nn_idx_all[b, cur_id] = nn_idx_1
+                nn_idx = nn_idx.reshape(self.n_qo_heads, 2, -1)
+                nn_idx_0 = nn_idx[:, 0, :].reshape(
+                    self.n_kv_heads, self.ratio, -1
+                )
+                nn_idx_1 = nn_idx[:, 1, :].reshape(
+                    self.n_kv_heads, self.ratio, -1
+                )
+                if self.n_prefetch_layers > 1:
+                    self.nn_idx_all[b, cur_id] = nn_idx_1
 
-            # Handle the case where there are duplicated integers in the same row of nn_idx_0
-            if self.ratio > 1:
-                nn_idx_0_interleaved = nn_idx_0.transpose(
-                    0, 2, 1).reshape(self.n_kv_heads, -1)
-                nn_idx_0 = np.vstack([utils.first_k_unique(
-                    row, num_neighbours) for row in nn_idx_0_interleaved])
+                # Merge the Q-head result streams belonging to each KV head.
+                if self.ratio > 1:
+                    nn_idx_0_interleaved = nn_idx_0.transpose(
+                        0, 2, 1
+                    ).reshape(self.n_kv_heads, -1)
+                    nn_idx_0 = np.vstack(
+                        [
+                            utils.first_k_unique(row, num_neighbours)
+                            for row in nn_idx_0_interleaved
+                        ]
+                    )
+                else:
+                    nn_idx_0 = nn_idx_0.reshape(self.n_kv_heads, -1)
             else:
-                nn_idx_0 = nn_idx_0.reshape(self.n_kv_heads, -1)
+                candidate_result = query_candidate_provider(
+                    self.dci_candidate_provider,
+                    layer_idx=cur_id,
+                    query_states=_query,
+                    num_neighbours=num_neighbours,
+                    state=self,
+                )
+                nn_idx_0 = validate_leaf_ids(
+                    candidate_result.effective_leaf_ids,
+                    n_kv_heads=self.n_kv_heads,
+                    num_neighbours=num_neighbours,
+                    num_leaves=self.dci_db[cur_id].num_leaves,
+                )
+                self.dci_candidate_plans[cur_id] = candidate_result.plan
+                if candidate_result.plan is not None:
+                    self._notify_dci(
+                        "candidate_plan",
+                        layer_idx=cur_id,
+                        query_states=query_states,
+                        effective_leaf_ids=nn_idx_0,
+                        candidate_plan=candidate_result.plan,
+                    )
 
             nn_idx_0 = np.ascontiguousarray(nn_idx_0)
-            nn_idx_1 = np.ascontiguousarray(nn_idx_1)
 
             padded_arrays = torch.tensor(nn_idx_0, **self._ci32)
             head_ids = torch.arange(
@@ -864,6 +946,15 @@ class InferState:
             
             evict_num = (recall_idx >= 0).sum(1)
             kvc.ccc[b, head_ids, padded_arrays] = 0
+
+            self._notify_dci(
+                "query",
+                layer_idx=cur_id,
+                query_states=query_states,
+                selected_leaf_ids=self.selected_page_idx[cur_id],
+                recalled_leaf_ids=recall_idx,
+                evicted_page_ids=evicted_idx,
+            )
 
             return evicted_idx.contiguous(), recall_idx.contiguous(), evict_num
 

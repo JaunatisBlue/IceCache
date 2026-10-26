@@ -8,3 +8,17 @@ IceCache/benchmark/agent_cache/
 IceCache/source/build/
 IceCache/source/icecache/_mdci_batch.cpython-310-x86_64-linux-gnu.so
 code_ref/
+.hf_cache/
+!IceCache/benchmark/agent_cache/
+IceCache/benchmark/agent_cache/*
+!IceCache/benchmark/agent_cache/UNIFIED_RAG_KV_DESIGN.md
+!IceCache/benchmark/agent_cache/README.md
+!IceCache/benchmark/agent_cache/rag_kv_reuse_probe.py
+!IceCache/benchmark/agent_cache/unified_rag_sim.py
+!IceCache/benchmark/agent_cache/selector_optimality_probe.py
+!IceCache/benchmark/agent_cache/test_unified_page_index.py
+!IceCache/benchmark/agent_cache/dci_profile_cost_calibration.py
+!IceCache/benchmark/agent_cache/recall_cost_trace_probe.py
+!IceCache/benchmark/agent_cache/chance_constraint_calibration.py
+!IceCache/benchmark/agent_cache/summarize_kv_reuse.py
+!IceCache/benchmark/agent_cache/dci_backend_probe.py

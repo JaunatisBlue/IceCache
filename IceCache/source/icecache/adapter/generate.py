@@ -1,7 +1,7 @@
 # transformers==4.40.0
 
 from transformers.generation.utils import *
-from typing import List
+from typing import List, Optional, Union
 
 
 _Q_INPUT_IDS: torch.LongTensor = None
